@@ -1,0 +1,8 @@
+[project]
+name = "bayesian-if-agent"
+version = "0.1.0"
+description = "Bayesian agent that learns to play text adventure games"
+requires-python = ">=3.9"
+dependencies = [
+    "jericho>=3.0.0",
+]
