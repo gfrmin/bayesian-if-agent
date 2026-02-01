@@ -8,7 +8,6 @@ Bayesian agent that learns to play text adventure games. Maintains probabilistic
 
 ```bash
 uv sync
-uv run python -m spacy download en_core_web_sm
 mkdir -p games
 curl -L "https://www.ifarchive.org/if-archive/games/zcode/905.z5" -o games/905.z5
 ```

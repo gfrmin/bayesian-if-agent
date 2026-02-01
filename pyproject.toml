@@ -5,4 +5,5 @@ description = "Bayesian agent that learns to play text adventure games"
 requires-python = ">=3.9"
 dependencies = [
     "jericho>=3.0.0",
+    "en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
 ]

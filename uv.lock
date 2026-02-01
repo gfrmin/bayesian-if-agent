@@ -21,11 +21,15 @@ name = "bayesian-if-agent"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "en-core-web-sm" },
     { name = "jericho" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "jericho", specifier = ">=3.0.0" }]
+requires-dist = [
+    { name = "en-core-web-sm", url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" },
+    { name = "jericho", specifier = ">=3.0.0" },
+]
 
 [[package]]
 name = "blis"
@@ -333,6 +337,14 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/f1/61/a4b80a2083627fd7e5da93fac7fa65e9aad018802e61059553acac534dfc/cymem-2.0.13-cp39-cp39-musllinux_1_2_x86_64.whl", hash = "sha256:2fae4a29a36267772010a05ca85220e53f4fb3e1083d4f686342d8a3cc7620db", size = 234111, upload-time = "2025-11-14T14:58:31.974Z" },
     { url = "https://files.pythonhosted.org/packages/2a/40/23528b1c043004edcd0362cbc63d53b5d7c69512619f0d1cc0207e60f857/cymem-2.0.13-cp39-cp39-win_amd64.whl", hash = "sha256:a868c1e3fe4f6f51232883b7bee7319a35e36644604577f4c6032cf957b9056b", size = 40419, upload-time = "2025-11-14T14:58:33.135Z" },
     { url = "https://files.pythonhosted.org/packages/8c/b1/f98af0272fbb9a82609474ae6a393492fe706d860e2bff7ea45afd5aed1e/cymem-2.0.13-cp39-cp39-win_arm64.whl", hash = "sha256:c3ff57aec4f264451739b18b7eab9d161d51af42b570ca0392fc051dcca28cb1", size = 36566, upload-time = "2025-11-14T14:58:35.02Z" },
+]
+
+[[package]]
+name = "en-core-web-sm"
+version = "3.8.0"
+source = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl" }
+wheels = [
+    { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl", hash = "sha256:1932429db727d4bff3deed6b34cfc05df17794f4a52eeb26cf8928f7c1a0fb85" },
 ]
 
 [[package]]
