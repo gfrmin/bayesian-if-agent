@@ -29,23 +29,15 @@ This project explores the question: **what should be fixed vs. learned in an int
 ## Installation
 
 ```bash
-# 1. Clone or download this repository
 git clone <your-repo-url>
 cd bayesian-if-agent
 
-# 2. Install dependencies
+# Install dependencies (includes Jericho and spacy model)
 uv sync
 
-# 3. Download spacy model (required by Jericho)
-uv run python -m spacy download en_core_web_sm
-
-# 4. Download a game file
+# Download a game file
 mkdir -p games
-# 9:05 - a short, simple game perfect for testing
 curl -L "https://www.ifarchive.org/if-archive/games/zcode/905.z5" -o games/905.z5
-
-# Or Zork 1 for the classic experience
-curl -L "https://www.ifarchive.org/if-archive/games/zcode/zork1.z5" -o games/zork1.z5
 ```
 
 ## Quick Start
@@ -80,13 +72,12 @@ print(f"Transitions learned: {summary['final_transitions_learned']}")
 ## Running the Demo
 
 ```bash
-python runner.py
+uv run python setup_check.py   # verify setup + quick 3-action demo
+uv run python core.py           # unit tests for core components
+uv run python runner.py         # full demo: walkthrough + 5-episode learning run
 ```
 
-This will:
-1. Play through 9:05 following the walkthrough (to verify setup)
-2. Train the agent over 5 episodes with learning enabled
-3. Print statistics about what the agent learned
+`runner.py` plays through 9:05 following the walkthrough (to verify setup), then trains the agent over 5 episodes with learning enabled, printing statistics about what it learned.
 
 ## Architecture
 
@@ -126,31 +117,35 @@ This will:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## Key Files
+- **`core.py`** — All core components (GameState, StateParser, BeliefState, DynamicsModel, ActionSelector, BayesianIFAgent). Zero external dependencies — stdlib only.
+- **`runner.py`** — Jericho integration, game-specific parser (`EnhancedStateParser`), experiment runner.
 
-- `core.py` - Core agent components: GameState, DynamicsModel, BeliefState, ActionSelector, BayesianIFAgent
-- `runner.py` - Jericho integration and experiment runner
-- `pyproject.toml` - Python dependencies
+### Key Design Decisions
+
+- **Frozen dataclasses** for `GameState` — hashable, usable as dict keys in transition counts, immutable for particle representation.
+- **Count-based Bayesian inference** — `P(outcome|state,action) = count/total` with pseudocount prior (default 0.1). Simple, interpretable, online.
+- **Thompson sampling** — sample state from belief, sample outcome from dynamics, pick best action. Naturally balances exploration/exploitation.
+- **Particle filtering** — `Dict[GameState, float]` weights. Suited to discrete IF state spaces.
 
 ## Extending the Agent
 
 ### Custom State Parser
 
-The default parser uses simple heuristics. You can create a game-specific parser:
+The default parser uses simple heuristics. Create a game-specific parser by subclassing `StateParser`:
 
 ```python
 from core import StateParser, GameState
 
 class ZorkParser(StateParser):
     def _extract_location(self, obs: str, prev) -> str:
-        # Zork-specific location extraction
         if 'west of house' in obs.lower():
             return 'west_of_house'
-        # ... etc
         return super()._extract_location(obs, prev)
 ```
 
-### LLM-Enhanced Parser (Future)
+See `EnhancedStateParser` in `runner.py` for a full example.
+
+### LLM-Enhanced Parser
 
 The parser is the natural integration point for an LLM:
 
@@ -159,19 +154,10 @@ class LLMParser(StateParser):
     def __init__(self, llm_client):
         super().__init__()
         self.llm = llm_client
-    
+
     def parse(self, observation: str, previous_state) -> GameState:
-        prompt = f"""
-        Given this game observation:
-        {observation}
-        
-        Extract:
-        1. Current location (a short identifier)
-        2. Items the player is carrying
-        3. Important world state flags
-        
-        Return as JSON.
-        """
+        prompt = f"Given this game observation:\n{observation}\n\n"
+        prompt += "Extract: location, inventory, world state flags. Return as JSON."
         response = self.llm.complete(prompt)
         # Parse response into GameState
         ...
@@ -179,23 +165,15 @@ class LLMParser(StateParser):
 
 ### Informed Priors
 
-Currently the dynamics model uses uniform priors. An LLM could provide informed priors:
-
-```python
-def get_llm_prior(action_type: str) -> float:
-    """Ask LLM: how often does this type of action succeed in IF games?"""
-    # e.g., "take" actions usually succeed
-    # "attack" actions often fail unless you have a weapon
-    # etc.
-```
+The dynamics model uses uniform priors by default. You can set `prior_pseudocount` per action type in `DynamicsModel` to encode domain knowledge (e.g., "take" actions succeed more often than "attack" actions).
 
 ## Troubleshooting
 
 ### "No module named 'jericho'"
-Make sure you've run `uv sync` to install dependencies.
+Run `uv sync` to install dependencies.
 
 ### "FileNotFoundError: games/905.z5"
-Download the game file - see Installation step 5.
+Download the game file — see Installation.
 
 ### Jericho build errors
 Jericho requires gcc and make. On Ubuntu/Debian:
@@ -203,25 +181,20 @@ Jericho requires gcc and make. On Ubuntu/Debian:
 sudo apt-get install build-essential
 ```
 
-### "spacy model not found"
-```bash
-uv run python -m spacy download en_core_web_sm
-```
-
 ## Related Work
 
-- [Jericho](https://github.com/microsoft/jericho) - The IF game interface
-- [TextWorld](https://github.com/microsoft/TextWorld) - Procedural IF generation
-- [KG-A2C](https://arxiv.org/abs/2002.07626) - Knowledge graph RL for IF
-- [TALES](https://microsoft.github.io/tale-suite/) - Text adventure benchmark suite
+- [Jericho](https://github.com/microsoft/jericho) — The IF game interface
+- [TextWorld](https://github.com/microsoft/TextWorld) — Procedural IF generation
+- [KG-A2C](https://arxiv.org/abs/2002.07626) — Knowledge graph RL for IF
+- [TALES](https://microsoft.github.io/tale-suite/) — Text adventure benchmark suite
 
 ## Future Directions
 
-1. **LLM Integration**: Use LLMs for state parsing and prior elicitation
-2. **Structure Learning**: Learn which state variables matter (not just parameters)
-3. **Meta-Learning**: Transfer learned dynamics across similar games
-4. **Planning**: Look-ahead search under learned dynamics
-5. **Natural Language Beliefs**: Represent beliefs as propositions, not just state vectors
+1. **LLM Integration** — Use LLMs for state parsing and prior elicitation
+2. **Structure Learning** — Learn which state variables matter (not just parameters)
+3. **Meta-Learning** — Transfer learned dynamics across similar games
+4. **Planning** — Look-ahead search under learned dynamics
+5. **Natural Language Beliefs** — Represent beliefs as propositions, not just state vectors
 
 ## License
 
