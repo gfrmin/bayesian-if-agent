@@ -58,6 +58,16 @@ class GameState:
         )
 
 
+@dataclass(frozen=True)
+class Transition:
+    """A single observed transition with raw observation for re-parsing."""
+    state: GameState
+    action: str
+    next_state: GameState
+    reward: float
+    raw_observation: str
+
+
 # =============================================================================
 # DYNAMICS MODEL
 # =============================================================================
@@ -72,26 +82,35 @@ class DynamicsModel:
     
     def __init__(self, prior_pseudocount: float = 0.1):
         self.prior_pseudocount = prior_pseudocount
-        
+
         # Counts: (state, action) -> {(next_state, reward): count}
         self.transition_counts: Dict[Tuple[GameState, str], Dict[Tuple[GameState, float], float]] = \
             defaultdict(lambda: defaultdict(lambda: self.prior_pseudocount))
-        
+
         # Total counts per (state, action) for normalisation
         self.total_counts: Dict[Tuple[GameState, str], float] = \
             defaultdict(lambda: self.prior_pseudocount)
-        
+
         # Track what we've actually observed (vs just prior)
         self.observed_transitions: Set[Tuple[GameState, str, GameState, float]] = set()
+
+        # Full transition history for re-parsing during expansion
+        self.history: List[Transition] = []
     
-    def update(self, state: GameState, action: str, next_state: GameState, reward: float):
+    def update(self, state: GameState, action: str, next_state: GameState,
+               reward: float, raw_observation: str = ""):
         """Record an observed transition."""
         key = (state, action)
         outcome = (next_state, reward)
-        
+
         self.transition_counts[key][outcome] += 1.0
         self.total_counts[key] += 1.0
         self.observed_transitions.add((state, action, next_state, reward))
+
+        self.history.append(Transition(
+            state=state, action=action, next_state=next_state,
+            reward=reward, raw_observation=raw_observation
+        ))
     
     def predict(self, state: GameState, action: str) -> Dict[Tuple[GameState, float], float]:
         """
@@ -140,6 +159,15 @@ class DynamicsModel:
         # Subtract prior pseudocounts to get actual observation count
         total = self.total_counts[key]
         return max(0, int(total - self.prior_pseudocount))
+
+    def get_outcome_counts(self, state: GameState, action: str) -> Dict[Tuple[GameState, float], int]:
+        """Return actual observation counts (excluding pseudocounts) for each outcome."""
+        key = (state, action)
+        return {
+            outcome: max(0, int(count - self.prior_pseudocount))
+            for outcome, count in self.transition_counts[key].items()
+            if count > self.prior_pseudocount
+        }
 
 
 # =============================================================================
@@ -515,7 +543,8 @@ class BayesianIFAgent:
                     self.current_state,
                     last_action,
                     new_state,
-                    reward
+                    reward,
+                    raw_observation=observation
                 )
         
         # Update belief state
@@ -527,35 +556,45 @@ class BayesianIFAgent:
         
         # Record in history
         self.history.append({
-            'observation': observation[:200],  # Truncate for storage
+            'observation': observation,
             'parsed_state': str(new_state),
             'score': score,
             'reward': reward
         })
     
-    def act(self, candidate_actions: List[str], use_thompson: bool = True) -> str:
+    def act(self, candidate_actions: List[str], use_thompson: bool = True,
+            budget=None) -> str:
         """
         Select an action to take.
-        
+
+        If budget (a metareason.ComputationBudget) is provided, uses the
+        metareasoner's deliberate() instead of a single Thompson sample.
+
         Returns the chosen action.
         """
-        if use_thompson:
+        if budget is not None:
+            from metareason import deliberate
+            action, _meta = deliberate(
+                self.belief, self.dynamics, self.selector,
+                candidate_actions, budget
+            )
+        elif use_thompson:
             action = self.selector.thompson_sample(
                 self.belief,
                 self.dynamics,
                 candidate_actions
             )
         else:
-            action, values = self.selector.select_action(
+            action, _values = self.selector.select_action(
                 self.belief,
                 self.dynamics,
                 candidate_actions
             )
-        
+
         # Record action in history
         if self.history:
             self.history[-1]['action'] = action
-        
+
         return action
     
     def get_statistics(self) -> Dict:
@@ -564,6 +603,7 @@ class BayesianIFAgent:
             'total_steps': len(self.history),
             'unique_states_visited': len(set(h.get('parsed_state') for h in self.history)),
             'transitions_learned': len(self.dynamics.observed_transitions),
+            'dynamics_history_size': len(self.dynamics.history),
             'current_state': str(self.current_state),
             'current_score': self.previous_score,
             'belief_entropy': self.belief.entropy()

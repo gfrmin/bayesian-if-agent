@@ -7,6 +7,8 @@ Tracks performance and provides analysis.
 
 from jericho import FrotzEnv
 from core import BayesianIFAgent, StateParser, GameState
+from contradiction import detect_contradictions
+from expander import propose_expansion, evaluate_expansion, apply_expansion, rebuild_dynamics
 from typing import List, Dict, Optional, Tuple
 import os
 import time
@@ -201,33 +203,75 @@ class JerichoRunner:
         self,
         n_episodes: int,
         max_steps_per_episode: int = 100,
-        verbose: bool = False
+        verbose: bool = False,
+        enable_expansion: bool = True,
+        complexity_cost: float = 1.0,
     ) -> Dict:
         """
         Play multiple episodes to train the agent.
-        
+
         The agent retains learned dynamics across episodes.
+        When enable_expansion is True, runs contradiction detection and
+        state expansion after each episode.
         """
         all_stats = []
-        
+        total_contradictions = 0
+        variables_added: List[str] = []
+
         for i in range(n_episodes):
             print(f"\n{'='*40}")
             print(f"Episode {i+1}/{n_episodes}")
             print(f"{'='*40}")
-            
+
             stats = self.play_episode(
                 max_steps=max_steps_per_episode,
                 verbose=verbose
             )
             all_stats.append(stats)
-            
+
             print(f"Score: {stats['final_score']}/{stats['max_score']} in {stats['total_steps']} steps")
             print(f"Transitions learned: {stats['agent_stats']['transitions_learned']}")
-        
+
+            # --- Contradiction detection and expansion ---
+            if enable_expansion and self.agent is not None:
+                contradictions = detect_contradictions(self.agent.dynamics)
+                episode_contradictions = len(contradictions)
+                total_contradictions += episode_contradictions
+
+                if contradictions:
+                    print(f"Contradictions detected: {episode_contradictions}")
+                    remaining = n_episodes - (i + 1)
+
+                    for contradiction in contradictions:
+                        proposal = propose_expansion(
+                            contradiction, self.agent.dynamics.history
+                        )
+                        if proposal is None:
+                            continue
+                        if not evaluate_expansion(proposal, remaining, complexity_cost):
+                            continue
+
+                        # Apply the expansion
+                        print(f"  Expanding state with flag: {proposal.flag_name}")
+                        variables_added.append(proposal.flag_name)
+
+                        new_transitions = apply_expansion(
+                            proposal.flag_name,
+                            self.agent.dynamics.history,
+                            self.agent.parser.parse,
+                        )
+                        new_dynamics = rebuild_dynamics(
+                            new_transitions,
+                            self.agent.dynamics.prior_pseudocount,
+                        )
+                        self.agent.dynamics = new_dynamics
+                        # Only apply one expansion per episode to keep things stable
+                        break
+
         # Summary statistics
         scores = [s['final_score'] for s in all_stats]
         steps = [s['total_steps'] for s in all_stats]
-        
+
         summary = {
             'episodes': n_episodes,
             'mean_score': sum(scores) / len(scores),
@@ -235,9 +279,11 @@ class JerichoRunner:
             'mean_steps': sum(steps) / len(steps),
             'victories': sum(1 for s in all_stats if s.get('victory')),
             'final_transitions_learned': self.agent.get_statistics()['transitions_learned'],
+            'total_contradictions_detected': total_contradictions,
+            'variables_added': variables_added,
             'all_stats': all_stats
         }
-        
+
         return summary
     
     def get_learned_dynamics_summary(self) -> str:
@@ -405,5 +451,7 @@ if __name__ == "__main__":
     print(f"Max score achieved: {summary['max_score_achieved']}")
     print(f"Mean steps: {summary['mean_steps']:.1f}")
     print(f"Total transitions learned: {summary['final_transitions_learned']}")
-    
+    print(f"Contradictions detected: {summary.get('total_contradictions_detected', 0)}")
+    print(f"Variables added: {summary.get('variables_added', [])}")
+
     print("\n" + runner.get_learned_dynamics_summary())
