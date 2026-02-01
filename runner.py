@@ -8,6 +8,7 @@ Tracks performance and provides analysis.
 from jericho import FrotzEnv
 from core import BayesianIFAgent, StateParser, GameState
 from typing import List, Dict, Optional, Tuple
+import os
 import time
 import json
 
@@ -367,7 +368,7 @@ if __name__ == "__main__":
     import sys
     
     # Default game path
-    game_path = "/home/claude/games/905.z5"
+    game_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "games", "905.z5")
     
     print("Bayesian IF Agent - Jericho Runner")
     print("=" * 60)
