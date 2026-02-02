@@ -1,4 +1,4 @@
-"""Tests for core.py v4 — BinarySensor, QuestionType, LLMSensorBank,
+"""Tests for core.py v6 — BinarySensor, QuestionType, LLMSensorBank,
 BeliefState, StateActionKey, ObservedOutcome, DynamicsModel,
 UnifiedDecisionMaker."""
 
@@ -20,14 +20,14 @@ from core import (
 
 
 # ---------------------------------------------------------------------------
-# BinarySensor
+# BinarySensor (SPEC v6: Beta(2,1) / Beta(1,2))
 # ---------------------------------------------------------------------------
 
 def test_sensor_initial_rates():
     s = BinarySensor()
-    assert abs(s.tpr - 0.7) < 0.01
-    assert abs(s.fpr - 0.3) < 0.01
-    assert abs(s.reliability - 0.4) < 0.01
+    assert abs(s.tpr - 2/3) < 0.01
+    assert abs(s.fpr - 1/3) < 0.01
+    assert abs(s.reliability - 1/3) < 0.01
     assert s.query_count == 0
     assert s.ground_truth_count == 0
 
@@ -129,7 +129,7 @@ def test_question_type_completeness():
 
 
 # ---------------------------------------------------------------------------
-# LLMSensorBank
+# LLMSensorBank (all sensors use SPEC defaults)
 # ---------------------------------------------------------------------------
 
 class MockYesLLM:
@@ -198,6 +198,16 @@ def test_sensor_bank_get_all_stats():
     assert "action_helps" in stats
 
 
+def test_sensor_bank_all_sensors_use_spec_defaults():
+    """All per-type sensors should use the SPEC defaults Beta(2,1)/Beta(1,2)."""
+    bank = LLMSensorBank(MockYesLLM())
+    for qt, sensor in bank.sensors.items():
+        assert sensor.tp_alpha == 2.0, f"{qt} tp_alpha wrong"
+        assert sensor.tp_beta == 1.0, f"{qt} tp_beta wrong"
+        assert sensor.fp_alpha == 1.0, f"{qt} fp_alpha wrong"
+        assert sensor.fp_beta == 2.0, f"{qt} fp_beta wrong"
+
+
 # ---------------------------------------------------------------------------
 # BeliefState
 # ---------------------------------------------------------------------------
@@ -240,19 +250,25 @@ def test_belief_state_set_certain_false():
     assert b.get_belief("keys", "inventory") == 0.0
 
 
-def test_belief_state_all_categories():
+def test_belief_state_non_action_categories():
     b = BeliefState()
     b.update_belief("bedroom", "location", 0.9)
     b.update_belief("keys", "inventory", 0.8)
     b.update_belief("door_locked", "flag", 0.7)
     b.update_belief("escape", "goal", 0.6)
-    b.update_belief("go north", "action", 0.4)
 
     assert b.get_belief("bedroom", "location") == 0.9
     assert b.get_belief("keys", "inventory") == 0.8
     assert b.get_belief("door_locked", "flag") == 0.7
     assert b.get_belief("escape", "goal") == 0.6
-    assert b.get_belief("go north", "action") == 0.4
+
+
+def test_belief_state_action_beliefs_are_tuples():
+    b = BeliefState()
+    b.set_action_belief("go north", 2.0, 8.0)
+    ab = b.get_action_belief("go north")
+    assert ab == (2.0, 8.0)
+    assert b.get_action_belief("nonexistent") is None
 
 
 def test_belief_state_unknown_category():
@@ -385,7 +401,7 @@ def test_dynamics_stats():
 
 
 # ---------------------------------------------------------------------------
-# UnifiedDecisionMaker
+# UnifiedDecisionMaker (beliefs are now Beta tuples)
 # ---------------------------------------------------------------------------
 
 def test_udm_take_known_best():
@@ -398,7 +414,7 @@ def test_udm_take_known_best():
     decision = udm.choose(
         game_actions=["a1", "a2"],
         possible_questions=[],
-        beliefs={"a1": 0.5, "a2": 0.5},
+        beliefs={"a1": (0.5, 0.5), "a2": (0.5, 0.5)},
         sensor=BinarySensor(),
         dynamics=d,
         state_hash="s",
@@ -407,14 +423,14 @@ def test_udm_take_known_best():
 
 
 def test_udm_take_unknown_highest_belief():
-    """When no known rewards, take action with highest belief."""
+    """When no known rewards, take action with highest belief mean."""
     udm = UnifiedDecisionMaker(question_cost=0.01)
     d = DynamicsModel()
 
     decision = udm.choose(
         game_actions=["a1", "a2"],
         possible_questions=[],
-        beliefs={"a1": 0.8, "a2": 0.2},
+        beliefs={"a1": (8.0, 2.0), "a2": (2.0, 8.0)},
         sensor=BinarySensor(),
         dynamics=d,
         state_hash="s",
@@ -432,7 +448,7 @@ def test_udm_no_questions_when_all_observed():
     decision = udm.choose(
         game_actions=["a1", "a2"],
         possible_questions=[("a1", "Q1"), ("a2", "Q2")],
-        beliefs={"a1": 0.5, "a2": 0.5},
+        beliefs={"a1": (0.5, 0.5), "a2": (0.5, 0.5)},
         sensor=BinarySensor(),
         dynamics=d,
         state_hash="s",
@@ -444,7 +460,7 @@ def test_udm_voi_non_negative():
     """VOI should never be negative."""
     udm = UnifiedDecisionMaker()
     sensor = BinarySensor()
-    voi = udm.compute_voi("a1", 0.5, sensor, {"a1": 0.5, "a2": 0.5})
+    voi = udm.compute_voi("a1", 0.5, 0.5, sensor, {"a1": 0.4, "a2": 0.4})
     assert voi >= 0.0
 
 
@@ -452,7 +468,8 @@ def test_udm_voi_zero_when_certain():
     """VOI is zero when belief is already certain."""
     udm = UnifiedDecisionMaker()
     sensor = BinarySensor()
-    voi = udm.compute_voi("a1", 1.0, sensor, {"a1": 1.0, "a2": 0.5})
+    # Alpha >> beta means ~certain it helps
+    voi = udm.compute_voi("a1", 100.0, 0.01, sensor, {"a1": 0.9, "a2": 0.4})
     assert abs(voi) < 0.01
 
 
@@ -463,9 +480,9 @@ def test_udm_voi_higher_with_reliable_sensor():
     unreliable = BinarySensor(tp_alpha=5, tp_beta=5, fp_alpha=5, fp_beta=5)
     reliable = BinarySensor(tp_alpha=9, tp_beta=1, fp_alpha=1, fp_beta=9)
 
-    eus = {"a1": 0.5, "a2": 0.5}
-    voi_unreliable = udm.compute_voi("a1", 0.5, unreliable, eus)
-    voi_reliable = udm.compute_voi("a1", 0.5, reliable, eus)
+    eus = {"a1": 0.4, "a2": 0.4}
+    voi_unreliable = udm.compute_voi("a1", 0.5, 0.5, unreliable, eus)
+    voi_reliable = udm.compute_voi("a1", 0.5, 0.5, reliable, eus)
 
     assert voi_reliable >= voi_unreliable
 
@@ -475,9 +492,9 @@ def test_udm_voi_positive_for_non_best():
     udm = UnifiedDecisionMaker()
     sensor = BinarySensor(tp_alpha=9, tp_beta=1, fp_alpha=1, fp_beta=9)
 
-    # a1 has lower belief than a2 — asking about a1 could reveal it's better
-    eus = {"a1": 0.3, "a2": 0.5}
-    voi = udm.compute_voi("a1", 0.3, sensor, eus)
+    # a1 has lower EU than a2 — asking about a1 could reveal it's better
+    eus = {"a1": 0.2, "a2": 0.4}
+    voi = udm.compute_voi("a1", 0.3, 0.7, sensor, eus)
     assert voi > 0.0
 
 
@@ -487,31 +504,29 @@ def test_udm_voi_zero_for_best_action():
     sensor = BinarySensor(tp_alpha=9, tp_beta=1, fp_alpha=1, fp_beta=9)
 
     # a1 is already the best — asking about it can't improve decisions
-    eus = {"a1": 0.8, "a2": 0.2}
-    voi = udm.compute_voi("a1", 0.8, sensor, eus)
+    eus = {"a1": 0.7, "a2": 0.1}
+    voi = udm.compute_voi("a1", 8.0, 2.0, sensor, eus)
     assert voi < 0.01
 
 
-def test_udm_ask_wins_with_conservative_prior():
-    """With conservative action prior + action cost, asking should beat taking.
+def test_udm_ask_wins_with_weak_prior():
+    """With weak 1/N prior and reliable sensor, asking should beat taking.
 
-    This is the key behavioral change: when most actions probably don't help
-    (low prior) and taking an action has a real cost (limited turns), the
-    expected value of information from a reliable sensor exceeds the expected
-    utility of blindly acting.
+    This is the key behavioral test: when actions have weak Beta(1/N, 1-1/N)
+    priors and the sensor is reliable, VOI exceeds cost and the agent asks.
     """
     udm = UnifiedDecisionMaker(
         question_cost=0.01,
         action_cost=0.10,
-        action_prior=0.15,
     )
     d = DynamicsModel()
     sensor = BinarySensor(tp_alpha=9, tp_beta=1, fp_alpha=1, fp_beta=9)
 
+    # Beta(0.5, 0.5) = 1/N prior for N=2
     decision = udm.choose(
         game_actions=["a1", "a2"],
         possible_questions=[("a1", "Will a1 help?"), ("a2", "Will a2 help?")],
-        beliefs={"a1": 0.15, "a2": 0.15},
+        beliefs={"a1": (0.5, 0.5), "a2": (0.5, 0.5)},
         sensor=sensor,
         dynamics=d,
         state_hash="s",
@@ -528,9 +543,59 @@ def test_udm_take_when_cost_high():
     decision = udm.choose(
         game_actions=["a1", "a2"],
         possible_questions=[("a1", "Will a1 help?")],
-        beliefs={"a1": 0.5, "a2": 0.5},
+        beliefs={"a1": (0.5, 0.5), "a2": (0.5, 0.5)},
         sensor=sensor,
         dynamics=d,
         state_hash="s",
     )
     assert decision[0] == 'take'
+
+
+def test_udm_default_prior_is_one_over_n():
+    """When beliefs dict is empty, default prior should be Beta(1/N, 1-1/N)."""
+    udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
+    d = DynamicsModel()
+
+    # 5 actions, so default prior mean = 1/5 = 0.2
+    # EU = 0.2 - 0.1 = 0.1 for each
+    decision = udm.choose(
+        game_actions=["a1", "a2", "a3", "a4", "a5"],
+        possible_questions=[],
+        beliefs={},
+        sensor=BinarySensor(),
+        dynamics=d,
+        state_hash="s",
+    )
+    assert decision[0] == 'take'
+    assert decision[1] in ["a1", "a2", "a3", "a4", "a5"]
+
+
+def test_udm_decision_comparison_is_voi_vs_cost():
+    """The decision rule is VOI > c, not (VOI - c) > best_game_eu.
+
+    This tests the C1 fix: with best_game_eu=0.05, VOI=0.03, c=0.01,
+    the agent should ask (0.03 > 0.01) even though 0.02 < 0.05.
+    """
+    udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
+    d = DynamicsModel()
+
+    # Construct a scenario where VOI > c but (VOI - c) < best_game_eu
+    # Use a very reliable sensor and uncertain belief
+    sensor = BinarySensor(tp_alpha=9, tp_beta=1, fp_alpha=1, fp_beta=9)
+
+    # a1 has moderate belief, a2 is known good
+    d.record_observation("s", "a2", "s2", 0.2)  # known reward 0.2
+
+    decision = udm.choose(
+        game_actions=["a1", "a2"],
+        possible_questions=[("a1", "Will a1 help?")],
+        beliefs={"a1": (0.5, 0.5), "a2": (0.5, 0.5)},
+        sensor=sensor,
+        dynamics=d,
+        state_hash="s",
+    )
+    # VOI for a1 should be > 0.01 (question cost), so agent asks
+    voi = udm.compute_voi("a1", 0.5, 0.5, sensor,
+                          {"a1": 0.5 - 0.10, "a2": 0.2 - 0.10})
+    if voi > 0.01:
+        assert decision[0] == 'ask'

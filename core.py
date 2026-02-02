@@ -29,12 +29,12 @@ class BinarySensor:
     """
 
     # True positive: P(says Yes | actually Yes)
-    tp_alpha: float = 7.0   # Prior: ~70% TPR
-    tp_beta: float = 3.0
+    tp_alpha: float = 2.0   # Prior: Beta(2,1), mean ~0.67 TPR
+    tp_beta: float = 1.0
 
     # False positive: P(says Yes | actually No)
-    fp_alpha: float = 3.0   # Prior: ~30% FPR
-    fp_beta: float = 7.0
+    fp_alpha: float = 1.0   # Prior: Beta(1,2), mean ~0.33 FPR
+    fp_beta: float = 2.0
 
     # Query count (for diagnostics)
     query_count: int = 0
@@ -139,13 +139,7 @@ class LLMSensorBank:
         self.llm = llm_client
 
         self.sensors: Dict[QuestionType, BinarySensor] = {
-            QuestionType.ACTION_HELPS: BinarySensor(tp_alpha=6, tp_beta=4, fp_alpha=3, fp_beta=7),
-            QuestionType.IN_LOCATION: BinarySensor(tp_alpha=8, tp_beta=2, fp_alpha=1, fp_beta=9),
-            QuestionType.HAVE_ITEM: BinarySensor(tp_alpha=8, tp_beta=2, fp_alpha=1, fp_beta=9),
-            QuestionType.STATE_FLAG: BinarySensor(tp_alpha=6, tp_beta=4, fp_alpha=2, fp_beta=8),
-            QuestionType.GOAL_DONE: BinarySensor(tp_alpha=6, tp_beta=4, fp_alpha=2, fp_beta=8),
-            QuestionType.PREREQ_MET: BinarySensor(tp_alpha=5, tp_beta=5, fp_alpha=3, fp_beta=7),
-            QuestionType.ACTION_POSSIBLE: BinarySensor(tp_alpha=7, tp_beta=3, fp_alpha=2, fp_beta=8),
+            qt: BinarySensor() for qt in QuestionType
         }
 
         # Cache to avoid redundant queries within same turn
@@ -238,16 +232,15 @@ class BeliefState:
 
     goal_beliefs: Dict[str, float] = field(default_factory=dict)
 
-    action_beliefs: Dict[str, float] = field(default_factory=dict)
+    action_beliefs: Dict[str, Tuple[float, float]] = field(default_factory=dict)
 
     def update_belief(self, belief_name: str, category: str, new_probability: float):
-        """Update a belief to a new probability."""
+        """Update a non-action belief to a new probability."""
         beliefs_map = {
             "location": self.location_beliefs,
             "inventory": self.inventory_beliefs,
             "flag": self.flag_beliefs,
             "goal": self.goal_beliefs,
-            "action": self.action_beliefs,
         }
         target = beliefs_map.get(category)
         if target is not None:
@@ -258,13 +251,12 @@ class BeliefState:
                 )
 
     def get_belief(self, belief_name: str, category: str, default: float = 0.5) -> float:
-        """Get current belief probability."""
+        """Get current belief probability (non-action categories)."""
         beliefs_map = {
             "location": self.location_beliefs,
             "inventory": self.inventory_beliefs,
             "flag": self.flag_beliefs,
             "goal": self.goal_beliefs,
-            "action": self.action_beliefs,
         }
         target = beliefs_map.get(category)
         if target is not None:
@@ -272,8 +264,16 @@ class BeliefState:
         return default
 
     def set_certain(self, belief_name: str, category: str, value: bool):
-        """Set a belief to certainty (from direct observation)."""
+        """Set a non-action belief to certainty (from direct observation)."""
         self.update_belief(belief_name, category, 1.0 if value else 0.0)
+
+    def get_action_belief(self, action: str) -> Optional[Tuple[float, float]]:
+        """Get Beta(alpha, beta) for an action, or None if not set."""
+        return self.action_beliefs.get(action)
+
+    def set_action_belief(self, action: str, alpha: float, beta: float):
+        """Set Beta(alpha, beta) for an action."""
+        self.action_beliefs[action] = (alpha, beta)
 
     def to_context_string(self) -> str:
         """Format beliefs for LLM context."""
@@ -379,23 +379,20 @@ class UnifiedDecisionMaker:
     Both action types evaluated by expected utility.
     """
 
-    def __init__(self, question_cost: float = 0.01, action_cost: float = 0.10, action_prior: float = 0.15):
+    def __init__(self, question_cost: float = 0.01, action_cost: float = 0.10):
         """
         Args:
             question_cost: Cost of asking one LLM question (in reward units).
             action_cost: Cost of taking a game action (models limited turns).
-            action_prior: Default P(action helps) for untried actions.
-                          Most IF actions don't help — 0.15 is conservative.
         """
         self.question_cost = question_cost
         self.action_cost = action_cost
-        self.action_prior = action_prior
 
     def choose(
         self,
         game_actions: List[str],
         possible_questions: List[Tuple[str, str]],  # (action, question)
-        beliefs: Dict[str, float],
+        beliefs: Dict[str, Tuple[float, float]],     # action -> (alpha, beta)
         sensor: BinarySensor,
         dynamics: 'DynamicsModel',
         state_hash: str,
@@ -403,8 +400,14 @@ class UnifiedDecisionMaker:
         """
         Choose between asking a question or taking a game action.
 
+        beliefs: Dict mapping action -> (alpha, beta) Beta parameters.
+        Default prior for unknown actions: Beta(1/N, 1-1/N) where N = len(game_actions).
+
         Returns: ('ask', (action, question)) or ('take', action)
         """
+        n = len(game_actions)
+        default_prior = (1.0 / n, 1.0 - 1.0 / n)
+
         # Compute EU for all game actions
         game_eus = {}
         for action in game_actions:
@@ -412,11 +415,10 @@ class UnifiedDecisionMaker:
             if known is not None:
                 game_eus[action] = known - self.action_cost
             else:
-                belief = beliefs.get(action, self.action_prior)
-                game_eus[action] = belief * 1.0 - self.action_cost
+                alpha, beta = beliefs.get(action, default_prior)
+                game_eus[action] = alpha / (alpha + beta) - self.action_cost
 
         best_game_action = max(game_actions, key=lambda a: game_eus[a])
-        best_game_eu = game_eus[best_game_action]
 
         # Compute EU for all questions (VOI - cost)
         best_question = None
@@ -426,15 +428,15 @@ class UnifiedDecisionMaker:
             if dynamics.has_observation(state_hash, action):
                 continue
 
-            belief = beliefs.get(action, self.action_prior)
-            voi = self.compute_voi(action, belief, sensor, game_eus)
+            alpha, beta = beliefs.get(action, default_prior)
+            voi = self.compute_voi(action, alpha, beta, sensor, game_eus)
             question_eu = voi - self.question_cost
 
             if question_eu > best_question_eu:
                 best_question_eu = question_eu
                 best_question = (action, question)
 
-        if best_question is not None and best_question_eu > best_game_eu:
+        if best_question is not None and best_question_eu > 0:
             return ('ask', best_question)
         else:
             return ('take', best_game_action)
@@ -442,15 +444,21 @@ class UnifiedDecisionMaker:
     def compute_voi(
         self,
         action: str,
-        current_belief: float,
+        alpha: float,
+        beta: float,
         sensor: BinarySensor,
         all_game_eus: Dict[str, float],
     ) -> float:
         """
         Compute value of information for asking about this action.
 
+        Uses Beta parameters (not just the mean) — two actions with the
+        same mean but different total counts have different VOI because
+        the uncertain one has more to learn from a question.
+
         VOI = E[max EU after asking] - max EU now
         """
+        current_belief = alpha / (alpha + beta)
         current_best_eu = max(all_game_eus.values())
 
         # P(LLM says yes)
@@ -488,19 +496,19 @@ class UnifiedDecisionMaker:
 # =============================================================================
 
 if __name__ == "__main__":
-    print("Bayesian IF Agent v4 - Core Unit Tests")
+    print("Bayesian IF Agent v6 - Core Unit Tests")
     print("=" * 60)
 
-    # Test 1: BinarySensor
+    # Test 1: BinarySensor (SPEC v6: Beta(2,1) / Beta(1,2))
     sensor = BinarySensor()
-    assert abs(sensor.tpr - 0.7) < 0.01
-    assert abs(sensor.fpr - 0.3) < 0.01
-    assert abs(sensor.reliability - 0.4) < 0.01
+    assert abs(sensor.tpr - 2/3) < 0.01
+    assert abs(sensor.fpr - 1/3) < 0.01
+    assert abs(sensor.reliability - 1/3) < 0.01
     print(f"Sensor: TPR={sensor.tpr:.2f}, FPR={sensor.fpr:.2f}, rel={sensor.reliability:.2f}")
 
     # Update with true positive
     sensor.update(said_yes=True, was_true=True)
-    assert sensor.tpr > 0.7
+    assert sensor.tpr > 2/3
     assert sensor.ground_truth_count == 1
     print(f"After TP: TPR={sensor.tpr:.2f}, FPR={sensor.fpr:.2f}")
 
@@ -516,7 +524,7 @@ if __name__ == "__main__":
     assert QuestionType.ACTION_HELPS.value == "action_helps"
     print(f"\nQuestionTypes: {[qt.value for qt in QuestionType]}")
 
-    # Test 3: LLMSensorBank with mock
+    # Test 3: LLMSensorBank with mock (all sensors use spec defaults)
     class MockLLM:
         def complete(self, prompt):
             return "YES"
@@ -554,6 +562,12 @@ if __name__ == "__main__":
     beliefs.set_certain("wallet", "inventory", False)
     assert beliefs.get_belief("wallet", "inventory") == 0.0
 
+    # Action beliefs are Beta tuples
+    beliefs.set_action_belief("go north", 2.0, 8.0)
+    ab = beliefs.get_action_belief("go north")
+    assert ab == (2.0, 8.0)
+    assert beliefs.get_action_belief("nonexistent") is None
+
     ctx = beliefs.to_context_string()
     assert "bedroom" in ctx
     assert "keys" in ctx
@@ -585,8 +599,8 @@ if __name__ == "__main__":
     assert stats["unique_state_actions"] == 1
     print(f"\nDynamics stats: {stats}")
 
-    # Test 7: UnifiedDecisionMaker
-    dm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10, action_prior=0.15)
+    # Test 7: UnifiedDecisionMaker (no action_prior — uses 1/N from beliefs)
+    dm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
 
     # When all actions known, should take best known
     dynamics2 = DynamicsModel()
@@ -596,7 +610,7 @@ if __name__ == "__main__":
     decision = dm.choose(
         game_actions=["a1", "a2"],
         possible_questions=[],
-        beliefs={"a1": 0.15, "a2": 0.15},
+        beliefs={"a1": (0.5, 0.5), "a2": (0.5, 0.5)},
         sensor=BinarySensor(),
         dynamics=dynamics2,
         state_hash="s",
@@ -611,16 +625,16 @@ if __name__ == "__main__":
     decision2 = dm.choose(
         game_actions=["a1", "a2"],
         possible_questions=[("a1", "Will a1 help?"), ("a2", "Will a2 help?")],
-        beliefs={"a1": 0.15, "a2": 0.15},
+        beliefs={"a1": (0.5, 0.5), "a2": (0.5, 0.5)},
         sensor=sensor3,
         dynamics=dynamics3,
         state_hash="s",
     )
     print(f"Decision (unknown, reliable sensor): {decision2}")
 
-    # VOI computation
-    voi = dm.compute_voi("a1", 0.15, sensor3, {"a1": 0.05, "a2": 0.05})
+    # VOI computation (now takes alpha, beta instead of point estimate)
+    voi = dm.compute_voi("a1", 0.5, 0.5, sensor3, {"a1": 0.4, "a2": 0.4})
     assert voi >= 0
     print(f"VOI: {voi:.4f}")
 
-    print("\nAll core v4 tests passed!")
+    print("\nAll core v6 tests passed!")

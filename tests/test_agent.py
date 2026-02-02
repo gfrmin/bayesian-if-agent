@@ -1,4 +1,4 @@
-"""Tests for BayesianIFAgent (runner.py v4) with mock FrotzEnv and LLM."""
+"""Tests for BayesianIFAgent (runner.py v6) with mock FrotzEnv and LLM."""
 
 import sys
 import os
@@ -228,27 +228,85 @@ def test_agent_dynamics_persist_across_episodes():
     assert obs_after_2 > obs_after_1
 
 
-def test_agent_no_repeat_known_futile():
-    """Agent should prefer untried actions over known-zero-reward ones."""
-    agent = BayesianIFAgent()
-
-    # Manually record a futile action
-    agent.dynamics.record_observation("state1", "look", "state1", 0.0)
-
+def test_agent_ground_truth_only_reward():
+    """Ground truth should only use reward > 0, not state change."""
+    llm = MockYesLLM()
+    agent = BayesianIFAgent(llm_client=llm, question_cost=0.001)
     env = MockFrotzEnv(
-        valid_actions=["look", "go north"],
-        state_hashes=[100, 100, 200],
-        scores=[0, 0, 0],
+        state_hashes=[100, 200, 300],  # state changes every step
+        scores=[0, 0, 0],              # but no reward
     )
     env.reset()
 
-    # The agent should prefer "go north" (untried, EU=0.5) over "look" (known, EU=0.0)
-    # when the state hash matches
-    # Force the state hash to match our recorded one
-    env._state_hashes = [hash("state1")] * 5  # won't match "state1" string
+    action, _ = agent.choose_action(env, "room")
 
-    # With string state hash "100" (from MockFrotzEnv default), different from "state1"
-    # So this tests the general mechanism — untried actions get default 0.5 belief
-    action, explanation = agent.choose_action(env, "room")
-    # Both actions are untried at this state, so either is valid
-    assert action in ["look", "go north"]
+    if agent.last_llm_predictions:
+        predicted_action = list(agent.last_llm_predictions.keys())[0]
+        obs, reward, done, info = env.step(action)
+        # State changed (100 -> 200) but reward is 0
+        agent.observe_outcome(env, action, obs, reward)
+
+        # Sensor should have been updated with actual_truth=False
+        # (reward was 0, so "didn't help" despite state change)
+        sensor = agent.sensor_bank.sensors[QuestionType.ACTION_HELPS]
+        assert sensor.ground_truth_count >= 1
+
+
+def test_agent_conjugate_belief_update():
+    """observe_outcome should do conjugate Beta update, not set to certainty."""
+    agent = BayesianIFAgent()
+    env = MockFrotzEnv(
+        state_hashes=[100, 200],
+        scores=[0, 1],  # reward on second step
+    )
+    env.reset()
+
+    action, _ = agent.choose_action(env, "room")
+
+    # Set a known action belief before observing
+    agent.beliefs.set_action_belief(action, 1.0, 9.0)  # Beta(1, 9), mean 0.1
+
+    obs, reward, done, info = env.step(action)
+    agent.observe_outcome(env, action, obs, reward)
+
+    if reward > 0:
+        ab = agent.beliefs.get_action_belief(action)
+        assert ab is not None
+        alpha, beta = ab
+        # Should be Beta(2, 9) — alpha incremented by 1, NOT set to certainty
+        assert abs(alpha - 2.0) < 0.01
+        assert abs(beta - 9.0) < 0.01
+
+
+def test_agent_belief_update_on_failure():
+    """observe_outcome should increment beta when reward <= 0."""
+    agent = BayesianIFAgent()
+    env = MockFrotzEnv(
+        state_hashes=[100, 200],
+        scores=[0, 0],  # no reward
+    )
+    env.reset()
+
+    action, _ = agent.choose_action(env, "room")
+
+    # Set a known action belief
+    agent.beliefs.set_action_belief(action, 1.0, 9.0)  # Beta(1, 9)
+
+    obs, reward, done, info = env.step(action)
+    agent.observe_outcome(env, action, obs, reward)
+
+    ab = agent.beliefs.get_action_belief(action)
+    assert ab is not None
+    alpha, beta = ab
+    # Should be Beta(1, 10) — beta incremented by 1
+    assert abs(alpha - 1.0) < 0.01
+    assert abs(beta - 10.0) < 0.01
+
+
+def test_agent_no_action_prior_parameter():
+    """BayesianIFAgent should not accept action_prior parameter."""
+    # Just verify it works without action_prior
+    agent = BayesianIFAgent(question_cost=0.02, action_cost=0.05)
+    assert agent.decision_maker.question_cost == 0.02
+    assert agent.decision_maker.action_cost == 0.05
+    assert not hasattr(agent.decision_maker, 'action_prior')

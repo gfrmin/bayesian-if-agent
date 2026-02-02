@@ -25,6 +25,27 @@ from core import (
 )
 
 
+def _moment_match_beta(
+    alpha: float,
+    beta: float,
+    sensor: 'BinarySensor',
+    said_yes: bool,
+) -> Tuple[float, float]:
+    """
+    Update Beta(alpha, beta) from a sensor observation, moment-matching
+    the posterior back to a Beta distribution.
+
+    The likelihood P(yes | theta) = TPR * theta + FPR * (1 - theta) is linear
+    in theta, so the exact posterior is not Beta. We compute the posterior mean
+    via Bayes' rule and preserve the total count, incrementing by 1 to reflect
+    the new evidence.
+    """
+    prior_mean = alpha / (alpha + beta)
+    posterior_mean = sensor.posterior(prior_mean, said_yes)
+    new_total = alpha + beta + 1.0
+    return (posterior_mean * new_total, (1.0 - posterior_mean) * new_total)
+
+
 class BayesianIFAgent:
     """
     Bayesian IF agent with LLM as queryable sensor bank.
@@ -45,7 +66,6 @@ class BayesianIFAgent:
         llm_client=None,
         question_cost: float = 0.01,
         action_cost: float = 0.10,
-        action_prior: float = 0.15,
     ):
         self.sensor_bank: Optional[LLMSensorBank] = (
             LLMSensorBank(llm_client) if llm_client is not None else None
@@ -55,7 +75,6 @@ class BayesianIFAgent:
         self.decision_maker = UnifiedDecisionMaker(
             question_cost=question_cost,
             action_cost=action_cost,
-            action_prior=action_prior,
         )
 
         # Tracking
@@ -90,10 +109,12 @@ class BayesianIFAgent:
 
         context = f"Observation: {observation[:500]}\n\n{self.beliefs.to_context_string()}"
 
-        # Build current belief dict for actions
-        default_prior = self.decision_maker.action_prior
-        action_beliefs = {
-            a: self.beliefs.get_belief(a, "action", default=default_prior)
+        # Build current belief dict for actions: Beta(alpha, beta) tuples.
+        # Default prior: Beta(1/N, 1-1/N) — mean 1/N, total count 1.
+        n = len(valid_actions)
+        default_prior = (1.0 / n, 1.0 - 1.0 / n)
+        action_beliefs: Dict[str, Tuple[float, float]] = {
+            a: self.beliefs.get_action_belief(a) or default_prior
             for a in valid_actions
         }
 
@@ -103,6 +124,8 @@ class BayesianIFAgent:
             else BinarySensor()
         )
 
+        # Defensive bound on questions per turn (VOI > cost should self-terminate,
+        # but this guards against pathological edge cases).
         max_questions_per_turn = 10
         questions_this_turn = 0
 
@@ -133,8 +156,9 @@ class BayesianIFAgent:
                 if known is not None:
                     explanation = f"EU={known:.3f} (known)"
                 else:
-                    belief = action_beliefs.get(game_action, 0.5)
-                    explanation = f"EU={belief:.3f} (belief={belief:.2f})"
+                    alpha, beta = action_beliefs.get(game_action, default_prior)
+                    mean = alpha / (alpha + beta)
+                    explanation = f"EU={mean:.3f} (belief={mean:.2f})"
 
                 self.last_action = game_action
                 return game_action, explanation
@@ -146,10 +170,14 @@ class BayesianIFAgent:
                     QuestionType.ACTION_HELPS, question, context
                 )
 
-                prior = action_beliefs[action_to_ask]
-                posterior = sensor.posterior(prior, answer)
-                action_beliefs[action_to_ask] = posterior
-                self.beliefs.update_belief(action_to_ask, "action", posterior)
+                # Update belief via Bayes' rule, moment-match back to Beta
+                alpha, beta = action_beliefs[action_to_ask]
+                action_beliefs[action_to_ask] = _moment_match_beta(
+                    alpha, beta, sensor, answer
+                )
+                self.beliefs.set_action_belief(
+                    action_to_ask, *action_beliefs[action_to_ask]
+                )
 
                 self.last_llm_predictions[action_to_ask] = answer
 
@@ -181,7 +209,8 @@ class BayesianIFAgent:
             )
 
         # Ground truth: did the action "help"?
-        helped = reward > 0 or next_state_hash != self.current_state_hash
+        # Only reward counts. Not state change. Noisy ground truth poisons learning.
+        helped = reward > 0
 
         # Update sensor for any predictions we made about this action
         if self.sensor_bank is not None and action in self.last_llm_predictions:
@@ -194,8 +223,14 @@ class BayesianIFAgent:
 
         self.last_llm_predictions = {}
 
-        if reward > 0:
-            self.beliefs.set_certain(action, "action", True)
+        # Conjugate Beta update from ground truth
+        ab = self.beliefs.get_action_belief(action)
+        if ab is not None:
+            alpha, beta = ab
+            if helped:
+                self.beliefs.set_action_belief(action, alpha + 1, beta)
+            else:
+                self.beliefs.set_action_belief(action, alpha, beta + 1)
 
     def play_episode(
         self,
@@ -330,7 +365,6 @@ def main():
     parser.add_argument("--model", default="llama3.1:latest")
     parser.add_argument("--question-cost", type=float, default=0.01)
     parser.add_argument("--action-cost", type=float, default=0.10)
-    parser.add_argument("--action-prior", type=float, default=0.15)
     args = parser.parse_args()
 
     print("Bayesian IF Agent v4")
@@ -350,7 +384,6 @@ def main():
         llm_client=llm_client,
         question_cost=args.question_cost,
         action_cost=args.action_cost,
-        action_prior=args.action_prior,
     )
 
     agent.play_multiple_episodes(

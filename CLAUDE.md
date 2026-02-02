@@ -43,7 +43,6 @@ uv run python runner.py          # full 10-episode learning run
 uv run python runner.py --episodes 3 --verbose  # verbose learning run
 uv run python runner.py --question-cost 0.05     # adjust LLM query cost
 uv run python runner.py --action-cost 0.15       # increase cost of taking actions
-uv run python runner.py --action-prior 0.10      # more conservative action prior
 ```
 
 Game files go in `games/`. Download 9:05: `curl -L "https://www.ifarchive.org/if-archive/games/zcode/905.z5" -o games/905.z5`
