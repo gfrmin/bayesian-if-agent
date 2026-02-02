@@ -1,1131 +1,585 @@
-# Adaptive Bayesian IF Agent: Specification v4
+# Bayesian IF Agent: Specification v6
 
-## The Core Insight
+## Design Principles (NON-NEGOTIABLE)
 
-The LLM is a **queryable sensor bank**. We can ask it anything. To use its answers as proper Bayesian evidence, we restrict outputs to simple forms (yes/no) and learn the sensor's reliability from experience.
+These principles are not suggestions. They define what this project is.
 
-The agent is an **expected utility maximiser**. Every action choice is argmax E[U]. No hacks, no overrides, no "follow the oracle X% of the time."
+### 1. Everything is Expected Utility Maximisation
 
-Direct experience dominates. In a deterministic game, once you've observed an outcome, there's no uncertainty. The LLM's opinion becomes irrelevant for that state-action pair.
+Every decision — whether to ask a question or take a game action — is:
+
+$$a^* = \arg\max_a \mathbb{E}[U | a, \text{beliefs}]$$
+
+No special cases. No "follow LLM 70% of the time." No "explore with probability ε." Just EU.
+
+### 2. No Hacks
+
+If the agent behaves badly, the solution is better modeling, not bolted-on fixes.
+
+**Forbidden:**
+- Exploration bonuses
+- Loop detection
+- Novelty rewards
+- "If stuck, do X"
+- Any rule that isn't derived from EU maximisation
+
+**Instead:** Figure out why EU maximisation gives wrong answer. Fix the model.
+
+### 3. LLM Outputs Are Data
+
+The LLM is a sensor. Its outputs are observations that update beliefs via Bayes' rule:
+
+$$P(\text{true} | \text{LLM says yes}) = \frac{P(\text{LLM says yes} | \text{true}) \cdot P(\text{true})}{P(\text{LLM says yes})}$$
+
+The agent learns sensor reliability (TPR, FPR) from experience. If the LLM is unreliable, the agent learns to ignore it.
+
+LLM outputs are **never** commands to follow blindly.
+
+### 4. Direct Experience Is Certain
+
+The game is deterministic. If we tried action A in state S and got outcome O:
+
+$$P(O | S, A) = 1$$
+
+No uncertainty. Known outcomes have EU = observed reward − c_act. No need to ask the LLM about known outcomes.
+
+### 5. Be Honest About Parameters
+
+Every parameter must be justified:
+- **Question cost c:** Real cost of computation time. Not a hack to limit questions.
+- **Action cost c_act:** Opportunity cost of spending a game turn. Derived from finite horizon.
+- **Prior P(helps):** Beta(1/N, 1−1/N). Derived from problem structure, not a magic number.
+- **Sensor priors (TPR, FPR):** Initial estimates, updated from data.
+
+If we can't justify a parameter, we shouldn't have it.
+
+### 6. When Stuck, Ask: What Would a Rational Agent Do?
+
+Then derive the math. If the math says something surprising, either:
+- Our model is missing something (fix the model)
+- The result is actually correct (accept it)
+
+Never: "The math says X but let's do Y instead."
+
+---
+
+## The Problem
+
+An agent plays text adventure games (Interactive Fiction). It observes text, chooses from valid actions, receives rewards. Goal: maximise score.
+
+The agent has access to an LLM oracle it can query with yes/no questions.
+
+**Challenge:** Games require long action sequences with sparse rewards. Random exploration fails. The LLM has relevant knowledge but is imperfect.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                              GAME                                   │
-│                                                                     │
-│  Observations: text, score, valid_actions                           │
-│  Ground truth: outcomes of actions (deterministic)                  │
-└──────────────────────────────────┬──────────────────────────────────┘
-                                   │
-                                   ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                      LLM SENSOR BANK                                │
-│                                                                     │
-│  Binary questions with learned reliability:                         │
-│                                                                     │
-│  ┌─────────────────────┐  ┌─────────────────────┐                   │
-│  │ "Will X help?"      │  │ "Am I in location?" │                   │
-│  │ TPR: 0.65 FPR: 0.30 │  │ TPR: 0.85 FPR: 0.10 │                   │
-│  └─────────────────────┘  └─────────────────────┘                   │
-│                                                                     │
-│  ┌─────────────────────┐  ┌─────────────────────┐                   │
-│  │ "Do I have item?"   │  │ "Is goal done?"     │                   │
-│  │ TPR: 0.80 FPR: 0.15 │  │ TPR: 0.60 FPR: 0.25 │                   │
-│  └─────────────────────┘  └─────────────────────┘                   │
-│                                                                     │
-│  Agent can ask ANY question. Learns reliability from ground truth.  │
-└──────────────────────────────────┬──────────────────────────────────┘
-                                   │
-                                   ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                      BELIEF STATE                                   │
-│                                                                     │
-│  P(in_bedroom) = 0.9                                                │
-│  P(have_keys) = 0.3                                                 │
-│  P(phone_answered) = 0.8                                            │
-│  P(action_X_helps) = 0.6                                            │
-│  ...                                                                │
-│                                                                     │
-│  Updated via Bayes' rule from:                                      │
-│  - LLM sensor readings (weighted by learned reliability)            │
-│  - Direct observations from game                                    │
-│  - Action outcomes (deterministic → certainty)                      │
-└──────────────────────────────────┬──────────────────────────────────┘
-                                   │
-                                   ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                      DYNAMICS MODEL                                 │
-│                                                                     │
-│  For each (state, action) we've tried:                              │
-│  - Observed outcome (next_state, reward)                            │
-│  - Observation count                                                │
-│                                                                     │
-│  Deterministic game → 1 observation = certainty                     │
-└──────────────────────────────────┬──────────────────────────────────┘
-                                   │
-                                   ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                      EXPECTED UTILITY MAXIMISER                     │
-│                                                                     │
-│  For each action:                                                   │
-│    If observed before: E[U] = observed_reward (certain)             │
-│    If not observed: E[U] = belief_weighted_estimate + info_value    │
-│                                                                     │
-│  Choose: argmax E[U]                                                │
-│                                                                     │
-│  No hacks. No overrides. Just expected utility.                     │
-└─────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                         GAME                                │
+│  - Observation (text)                                       │
+│  - Valid actions                                            │
+│  - Reward (sparse)                                          │
+│  - State (deterministic)                                    │
+└─────────────────────────────┬───────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    AGENT BELIEFS                            │
+│                                                             │
+│  For each action a:                                         │
+│    - P(a helps | evidence)                                  │
+│    - Known outcome if tried before                          │
+│                                                             │
+│  For LLM sensor:                                            │
+│    - TPR: P(says yes | actually helps)                      │
+│    - FPR: P(says yes | actually doesn't help)               │
+└─────────────────────────────┬───────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                 UNIFIED DECISION                            │
+│                                                             │
+│  Options:                                                   │
+│    - take(A): Execute game action A                         │
+│    - ask(Q): Query LLM with question Q                      │
+│                                                             │
+│  Choose: argmax EU                                          │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Core Principles
+## Unified Decision Space
 
-### 1. The LLM is a Sensor with Learnable Reliability
+The agent chooses between:
+- `take(A)` — execute game action, spend one turn, get reward
+- `ask(Q)` — query LLM, spend computation time, update beliefs
 
-We can ask the LLM any yes/no question. Its answers are evidence, not truth.
+### EU of Game Actions
 
-For each question type, we learn:
-- **TPR**: P(LLM says Yes | actually Yes)
-- **FPR**: P(LLM says Yes | actually No)
+Taking a game action costs a turn. In a finite-horizon game with T turns remaining and ~1 correct action per state, each wasted turn has expected opportunity cost. We encode this as $c_{\text{act}}$ — not a tuning knob, but a consequence of finite horizon. Without it, EU can't distinguish "ask a free question" from "burn a game turn."
 
-We learn these from ground truth:
-- Direct game feedback ("You're in the kitchen" when LLM said bedroom)
-- Action outcomes (LLM said "X will help", we tried X, it didn't)
+For action A in state S:
 
-### 2. Direct Experience is Certain
+**If outcome known** (we've tried A in S before):
+$$\mathbb{E}[U | \text{take}(A)] = R_{\text{observed}} - c_{\text{act}}$$
 
-The game is deterministic. If we tried action A in state S and got outcome O, we **know** that's what happens. No uncertainty. No need to ask the LLM.
+**If outcome unknown:**
+$$\mathbb{E}[U | \text{take}(A)] = P(A \text{ helps}) \times R_{\text{success}} - c_{\text{act}}$$
 
-P(outcome = O | state S, action A, already observed O) = 1.0
+With $R_{\text{success}} = 1$:
+$$\mathbb{E}[U | \text{take}(A)] = P(A \text{ helps}) - c_{\text{act}}$$
 
-### 3. Every Decision is Expected Utility Maximisation
+### EU of Asking
 
-No special cases. No "follow oracle 70% of time". No "loop detection".
+For question Q:
+$$\mathbb{E}[U | \text{ask}(Q)] = \mathbb{E}[\max_A EU(A) | \text{after asking}] - c$$
 
-```
-action* = argmax_a E[U | state, action, all_evidence]
-```
+Where:
+- First term: expected best EU after belief update from answer
+- c: cost of asking (computation time, in utility units)
 
-Where all_evidence includes:
-- Direct observations from game
-- Previous action outcomes  
-- LLM sensor readings (weighted by reliability)
+### Value of Information
 
-### 4. Unified Decision Space
+$$\text{VOI}(Q) = \mathbb{E}[\max_A EU(A) | \text{after}] - \max_A EU(A) | \text{before}$$
 
-The agent chooses between two types of actions:
-- `take(A)` — take game action A, receive reward, advance game
-- `ask(Q)` — ask question Q to the LLM, update beliefs, no game reward
+This is the expected improvement from asking.
 
-Both are evaluated in the same framework:
+The EU of asking is:
+$$\mathbb{E}[U | \text{ask}(Q)] = \max_A EU(A)_{\text{before}} + \text{VOI}(Q) - c$$
 
-**For game actions:**
-$$\mathbb{E}[U | \text{take}(A)] = \mathbb{E}[R | A, \text{beliefs}]$$
+### The Decision Rule
 
-**For questions:**
-$$\mathbb{E}[U | \text{ask}(Q)] = \text{VOI}(Q) - c$$
+Compare best question to best game action:
 
-Where VOI(Q) is the expected improvement in subsequent action value from learning the answer, and $c$ is the cost of asking.
+$$\text{Ask if: } \text{VOI}(Q^*) > c$$
 
-**The decision:**
-$$\text{action}^* = \arg\max \left( \max_A \mathbb{E}[U | \text{take}(A)], \max_Q \mathbb{E}[U | \text{ask}(Q)] \right)$$
+Where $Q^* = \arg\max_Q \text{VOI}(Q)$.
 
-If a question's VOI minus cost exceeds all game actions' EU, ask first. Otherwise, act.
-
-### 5. The Cost of Asking
-
-The cost $c$ is real, not a hack. It represents the value of computation time.
-
-Even with a local LLM, asking takes wall-clock time. The agent exists in the real world where time has value. The parameter $c$ answers: "how much reward would I trade to save one LLM query?"
-
-- $c = 0$: Ask until VOI = 0 (unbounded questions if VOI never exactly zero)
-- $c > 0$: Ask less, act sooner
-- $c$ large: Almost never ask, rely on priors and experience
-
-The right $c$ depends on context. For a game we'll play many times, $c$ can be small (information is valuable). For a one-shot situation, $c$ might be larger.
-
-### 6. No Exploration Bonus Needed
-
-For untried actions, expected utility comes from beliefs:
-
-$$\mathbb{E}[U | \text{untried}] = P(\text{helps}) \times R_{\text{success}} + P(\text{doesn't}) \times R_{\text{fail}}$$
-
-For tried actions in a deterministic game, expected utility is the known outcome:
-
-$$\mathbb{E}[U | \text{tried}] = R_{\text{observed}}$$
-
-If we tried an action and got 0, its EU is 0. If we haven't tried an action and believe P(helps) = 0.5, its EU is 0.5. The untried action wins.
-
-**No exploration bonus needed.** Uncertainty itself gives higher expected value (when there's a chance of positive reward). The agent naturally explores because unknown actions have higher expected utility than known-bad actions.
+Equivalently: ask if the improvement from asking exceeds the cost.
 
 ---
 
-## Data Structures
+## Computing VOI
 
-### Binary Sensor
+For a question about action A:
+
+1. **Current belief:** $b = P(A \text{ helps})$ (Beta mean: $\alpha / (\alpha + \beta)$)
+
+2. **Predict LLM response:**
+   $$P(\text{yes}) = \text{TPR} \times b + \text{FPR} \times (1-b)$$
+
+3. **Posterior if yes:**
+   $$b_{\text{yes}} = \frac{\text{TPR} \times b}{\text{TPR} \times b + \text{FPR} \times (1-b)}$$
+
+4. **Posterior if no:**
+   $$b_{\text{no}} = \frac{(1-\text{TPR}) \times b}{(1-\text{TPR}) \times b + (1-\text{FPR}) \times (1-b)}$$
+
+5. **Best EU after each answer:**
+   $$EU^*_{\text{yes}} = \max(b_{\text{yes}} - c_{\text{act}}, \max_{A' \neq A} EU(A'))$$
+   $$EU^*_{\text{no}} = \max(b_{\text{no}} - c_{\text{act}}, \max_{A' \neq A} EU(A'))$$
+
+6. **VOI:**
+   $$\text{VOI} = P(\text{yes}) \times EU^*_{\text{yes}} + P(\text{no}) \times EU^*_{\text{no}} - EU^*_{\text{before}}$$
+
+---
+
+## Learning Sensor Reliability
+
+The agent learns TPR and FPR from experience.
+
+### Ground Truth
+
+When we take an action and observe the outcome, we get ground truth:
+
+$$\text{helped} = (\text{reward} > 0)$$
+
+**Important:** Only reward counts. Not state change. Changing clothes changes state but doesn't help. Noisy ground truth poisons learning.
+
+### Bayesian Update
+
+Model TPR and FPR as Beta distributions:
+
+```
+TPR ~ Beta(α_tp, β_tp)
+FPR ~ Beta(α_fp, β_fp)
+```
+
+Update rules:
+- LLM said yes, actually helped: α_tp += 1
+- LLM said yes, actually didn't help: α_fp += 1
+- LLM said no, actually helped: β_tp += 1
+- LLM said no, actually didn't help: β_fp += 1
+
+Point estimates:
+$$\text{TPR} = \frac{\alpha_{tp}}{\alpha_{tp} + \beta_{tp}}$$
+$$\text{FPR} = \frac{\alpha_{fp}}{\alpha_{fp} + \beta_{fp}}$$
+
+---
+
+## Prior Over Actions
+
+Each action's P(helps) is a Beta distribution, just like sensor TPR/FPR. This makes the prior **updateable** from both LLM observations and direct game outcomes.
+
+$$P(A \text{ helps}) \sim \text{Beta}(\alpha_A, \beta_A)$$
+
+Point estimate (for EU calculation): $\hat{p} = \alpha_A / (\alpha_A + \beta_A)$
+
+**The probability itself is uncertain.** The total count $\alpha + \beta$ measures how sure we are about $\hat{p}$. A low total count means the mean will shift substantially with new evidence.
+
+Default prior: **Beta(1/N, 1 − 1/N)** where N = number of available actions.
+
+- **Mean 1/N:** derives from problem structure. In most IF states, roughly one action advances the game. With no other information, spread that probability uniformly. The LLM sensor exists to break this symmetry. For N=15 actions, mean ≈ 0.07. Pessimistic — but that's correct when you have 15 choices and one is right.
+- **Total count 1:** maximally weak. A single ground truth observation doubles the total count and shifts the mean substantially. One "helped" → Beta(1/N + 1, 1 − 1/N), mean jumps dramatically. One "didn't help" → Beta(1/N, 2 − 1/N), mean drops toward zero.
+- **Why 1/N and not a fixed constant?** A fixed constant like 0.15 is a magic number — it doesn't derive from anything. 1/N derives from the structure: one action helps, don't know which. No magic.
+
+### Updating from ground truth
+
+Exact conjugate update (strong evidence, total count grows by 1):
+- Helped (reward > 0): $\alpha_A$ += 1
+- Didn't help (reward ≤ 0): $\beta_A$ += 1
+
+After 10 observations of "didn't help" starting from Beta(0.07, 0.93): Beta(0.07, 10.93), mean ≈ 0.006 — very certain it's bad.
+
+### Updating from LLM observations
+
+The LLM sensor gives a noisy binary observation about action A. The exact Bayesian update is:
+
+$$P(\theta | \text{obs}) \propto P(\text{obs} | \theta) \, P(\theta)$$
+
+where $P(\text{yes} | \theta) = \text{TPR} \cdot \theta + \text{FPR} \cdot (1 - \theta)$. This likelihood is linear in θ, so the posterior is **not** Beta — the conjugacy breaks. The implementation must approximate, e.g. by moment-matching back to a Beta. The spec does not prescribe a specific approximation; what matters is that the update is derived from Bayes' rule with the sensor's learned TPR/FPR, and that the result is a proper distribution (not a bare point estimate).
+
+### Why not 0.5?
+
+A Beta(1,1) prior (mean 0.5) says "each action is equally likely to help or not" — absurd for IF games. It overestimates EU for every action and suppresses VOI (less to learn when you're already confident).
+
+### Three families of Beta distributions
+
+After these changes, the agent holds exactly three families of Beta distributions:
+
+1. **Sensor TPR** ~ Beta(α\_tp, β\_tp) — "how often does the LLM say yes when the action truly helps?"
+2. **Sensor FPR** ~ Beta(α\_fp, β\_fp) — "how often does the LLM say yes when the action doesn't help?"
+3. **Action belief** ~ Beta(α\_a, β\_a) per action — "does this action help?"
+
+Every belief is a distribution. Every distribution learns. Every decision flows from these distributions via EU maximisation. Nothing else.
+
+---
+
+## Why No Exploration Bonus
+
+With proper priors:
+- Known bad action: EU = 0 − c_act < 0
+- Unknown action: EU = P(helps) − c_act (positive when P(helps) > c_act)
+
+Unknown actions already have higher EU than known-bad ones. Exploration emerges from uncertainty. No bonus needed.
+
+---
+
+## Why No Loop Detection
+
+The agent might cycle through clothing states. Each (state, action) pair is technically new because clothing combinations create different states.
+
+**The right fix:** The LLM should tell us "clothing actions don't help." If VOI > cost, we ask. The LLM says "no, putting on pants won't get you to work." We update P(helps) downward. We stop cycling.
+
+**The wrong fix:** Detect loops, force random action. This is a hack that hides the real problem.
+
+If the agent still loops after asking, either:
+- The LLM is unreliable (we learn this, stop trusting it)
+- The VOI calculation has a bug (fix the bug)
+- The model is missing something (improve the model)
+
+---
+
+## Implementation
+
+### BinarySensor
 
 ```python
-from dataclasses import dataclass
-import math
-
 @dataclass
 class BinarySensor:
-    """
-    A yes/no sensor with learned reliability.
+    """Yes/no sensor with learned reliability."""
     
-    Models P(sensor_output | truth) as Beta distributions.
-    """
+    # TPR: P(yes | true)
+    tp_alpha: float = 2.0
+    tp_beta: float = 1.0
     
-    # True positive: P(says Yes | actually Yes)
-    tp_alpha: float = 7.0   # Prior: ~70% TPR
-    tp_beta: float = 3.0
-    
-    # False positive: P(says Yes | actually No)
-    fp_alpha: float = 3.0   # Prior: ~30% FPR
-    fp_beta: float = 7.0
-    
-    # Query count (for diagnostics)
-    query_count: int = 0
-    ground_truth_count: int = 0
+    # FPR: P(yes | false)  
+    fp_alpha: float = 1.0
+    fp_beta: float = 2.0
     
     @property
     def tpr(self) -> float:
-        """Expected true positive rate."""
         return self.tp_alpha / (self.tp_alpha + self.tp_beta)
     
     @property
     def fpr(self) -> float:
-        """Expected false positive rate."""
         return self.fp_alpha / (self.fp_alpha + self.fp_beta)
     
-    @property
-    def reliability(self) -> float:
-        """Overall reliability score."""
-        return self.tpr - self.fpr  # Ranges from -1 to 1
-    
-    def update(self, said_yes: bool, was_true: bool):
-        """
-        Update reliability from ground truth.
-        
-        Called when we discover the actual truth.
-        """
-        self.ground_truth_count += 1
-        
-        if was_true:
-            if said_yes:
-                self.tp_alpha += 1  # True positive
-            else:
-                self.tp_beta += 1   # False negative
-        else:
-            if said_yes:
-                self.fp_alpha += 1  # False positive
-            else:
-                self.fp_beta += 1   # True negative
-    
     def posterior(self, prior: float, said_yes: bool) -> float:
-        """
-        P(true | LLM response) via Bayes' rule.
-        
-        Args:
-            prior: P(true) before observing LLM response
-            said_yes: Whether LLM said yes
-        
-        Returns:
-            P(true | LLM response)
-        """
+        """P(true | LLM response)"""
         if said_yes:
-            # P(true | yes) = P(yes | true) P(true) / P(yes)
-            p_yes_if_true = self.tpr
-            p_yes_if_false = self.fpr
-            
-            numerator = p_yes_if_true * prior
-            denominator = p_yes_if_true * prior + p_yes_if_false * (1 - prior)
+            num = self.tpr * prior
+            denom = self.tpr * prior + self.fpr * (1 - prior)
         else:
-            # P(true | no) = P(no | true) P(true) / P(no)
-            p_no_if_true = 1 - self.tpr
-            p_no_if_false = 1 - self.fpr
-            
-            numerator = p_no_if_true * prior
-            denominator = p_no_if_true * prior + p_no_if_false * (1 - prior)
-        
-        if denominator == 0:
-            return prior
-        
-        return numerator / denominator
+            num = (1 - self.tpr) * prior
+            denom = (1 - self.tpr) * prior + (1 - self.fpr) * (1 - prior)
+        return num / denom if denom > 0 else prior
     
-    def get_stats(self) -> dict:
-        return {
-            "tpr": self.tpr,
-            "fpr": self.fpr,
-            "reliability": self.reliability,
-            "queries": self.query_count,
-            "ground_truths": self.ground_truth_count,
-        }
+    def update(self, said_yes: bool, actual: bool):
+        """Update from ground truth."""
+        if actual:
+            if said_yes:
+                self.tp_alpha += 1
+            else:
+                self.tp_beta += 1
+        else:
+            if said_yes:
+                self.fp_alpha += 1
+            else:
+                self.fp_beta += 1
 ```
 
-### Sensor Bank
+### DynamicsModel
 
 ```python
-from typing import Dict, Tuple, Optional
-from enum import Enum
-
-class QuestionType(Enum):
-    ACTION_HELPS = "action_helps"       # "Will action X make progress?"
-    IN_LOCATION = "in_location"         # "Am I in the bedroom?"
-    HAVE_ITEM = "have_item"             # "Do I have the keys?"
-    STATE_FLAG = "state_flag"           # "Is the door locked?"
-    GOAL_DONE = "goal_done"             # "Have I answered the phone?"
-    PREREQ_MET = "prereq_met"           # "Can I go east?"
-    ACTION_POSSIBLE = "action_possible" # "Is 'open door' available?"
-
-class LLMSensorBank:
-    """
-    The LLM as a collection of binary sensors.
-    
-    Each question type has independently learned reliability.
-    """
-    
-    def __init__(self, llm_client):
-        self.llm = llm_client
-        
-        # Initialize sensors with different priors based on expected reliability
-        self.sensors: Dict[QuestionType, BinarySensor] = {
-            QuestionType.ACTION_HELPS: BinarySensor(tp_alpha=6, tp_beta=4, fp_alpha=3, fp_beta=7),
-            QuestionType.IN_LOCATION: BinarySensor(tp_alpha=8, tp_beta=2, fp_alpha=1, fp_beta=9),
-            QuestionType.HAVE_ITEM: BinarySensor(tp_alpha=8, tp_beta=2, fp_alpha=1, fp_beta=9),
-            QuestionType.STATE_FLAG: BinarySensor(tp_alpha=6, tp_beta=4, fp_alpha=2, fp_beta=8),
-            QuestionType.GOAL_DONE: BinarySensor(tp_alpha=6, tp_beta=4, fp_alpha=2, fp_beta=8),
-            QuestionType.PREREQ_MET: BinarySensor(tp_alpha=5, tp_beta=5, fp_alpha=3, fp_beta=7),
-            QuestionType.ACTION_POSSIBLE: BinarySensor(tp_alpha=7, tp_beta=3, fp_alpha=2, fp_beta=8),
-        }
-        
-        # Cache to avoid redundant queries within same turn
-        self.query_cache: Dict[str, bool] = {}
-    
-    def ask(
-        self, 
-        question_type: QuestionType, 
-        question: str,
-        context: str = "",
-    ) -> Tuple[bool, float]:
-        """
-        Ask a yes/no question.
-        
-        Returns: (answer, posterior_multiplier)
-        
-        The posterior_multiplier indicates how much to update beliefs:
-        - High reliability sensor saying yes → large positive update
-        - Low reliability sensor → small update
-        """
-        cache_key = f"{question_type.value}:{question}"
-        
-        if cache_key in self.query_cache:
-            return self.query_cache[cache_key], self.sensors[question_type].reliability
-        
-        # Query the LLM
-        answer = self._query_llm(question, context)
-        
-        # Update query count
-        self.sensors[question_type].query_count += 1
-        
-        # Cache result
-        self.query_cache[cache_key] = answer
-        
-        return answer, self.sensors[question_type].reliability
-    
-    def update_from_ground_truth(
-        self, 
-        question_type: QuestionType, 
-        said_yes: bool, 
-        actual_truth: bool,
-    ):
-        """
-        Update sensor reliability from observed ground truth.
-        """
-        self.sensors[question_type].update(said_yes, actual_truth)
-    
-    def get_posterior(
-        self,
-        question_type: QuestionType,
-        prior: float,
-        said_yes: bool,
-    ) -> float:
-        """
-        Compute posterior probability given sensor reading.
-        """
-        return self.sensors[question_type].posterior(prior, said_yes)
-    
-    def clear_cache(self):
-        """Clear query cache (call at start of each turn)."""
-        self.query_cache = {}
-    
-    def _query_llm(self, question: str, context: str) -> bool:
-        """
-        Query LLM for yes/no answer.
-        """
-        prompt = f"""Answer this question about a text adventure game with only YES or NO.
-
-Context:
-{context}
-
-Question: {question}
-
-Answer (YES or NO):"""
-        
-        response = self.llm.complete(prompt).strip().upper()
-        
-        return response.startswith("YES")
-    
-    def get_all_stats(self) -> Dict[str, dict]:
-        return {qt.value: sensor.get_stats() for qt, sensor in self.sensors.items()}
-```
-
-### Belief State
-
-```python
-from dataclasses import dataclass, field
-from typing import Dict, List, Set, Any, Optional
-
-@dataclass
-class BeliefState:
-    """
-    Agent's beliefs as probability distributions.
-    
-    Each belief is a probability that something is true.
-    Updated via Bayes' rule from sensor readings and direct observations.
-    """
-    
-    # Location belief: P(in_location_X) for each location
-    location_beliefs: Dict[str, float] = field(default_factory=dict)
-    current_location: Optional[str] = None  # Most likely location
-    
-    # Inventory beliefs: P(have_item_X)
-    inventory_beliefs: Dict[str, float] = field(default_factory=dict)
-    
-    # State flag beliefs: P(flag_X_is_true)
-    flag_beliefs: Dict[str, float] = field(default_factory=dict)
-    
-    # Goal beliefs: P(goal_X_accomplished)
-    goal_beliefs: Dict[str, float] = field(default_factory=dict)
-    
-    # Action value beliefs: P(action_X_will_help)
-    action_beliefs: Dict[str, float] = field(default_factory=dict)
-    
-    def update_belief(self, belief_name: str, category: str, new_probability: float):
-        """Update a belief to a new probability."""
-        if category == "location":
-            self.location_beliefs[belief_name] = new_probability
-            # Update current_location to most likely
-            if self.location_beliefs:
-                self.current_location = max(self.location_beliefs, key=self.location_beliefs.get)
-        elif category == "inventory":
-            self.inventory_beliefs[belief_name] = new_probability
-        elif category == "flag":
-            self.flag_beliefs[belief_name] = new_probability
-        elif category == "goal":
-            self.goal_beliefs[belief_name] = new_probability
-        elif category == "action":
-            self.action_beliefs[belief_name] = new_probability
-    
-    def get_belief(self, belief_name: str, category: str, default: float = 0.5) -> float:
-        """Get current belief probability."""
-        if category == "location":
-            return self.location_beliefs.get(belief_name, default)
-        elif category == "inventory":
-            return self.inventory_beliefs.get(belief_name, default)
-        elif category == "flag":
-            return self.flag_beliefs.get(belief_name, default)
-        elif category == "goal":
-            return self.goal_beliefs.get(belief_name, default)
-        elif category == "action":
-            return self.action_beliefs.get(belief_name, default)
-        return default
-    
-    def set_certain(self, belief_name: str, category: str, value: bool):
-        """Set a belief to certainty (from direct observation)."""
-        self.update_belief(belief_name, category, 1.0 if value else 0.0)
-    
-    def to_context_string(self) -> str:
-        """Format beliefs for LLM context."""
-        lines = []
-        
-        if self.current_location:
-            lines.append(f"Location: {self.current_location} (confidence: {self.location_beliefs.get(self.current_location, 0):.0%})")
-        
-        # High-confidence inventory
-        has_items = [item for item, p in self.inventory_beliefs.items() if p > 0.7]
-        if has_items:
-            lines.append(f"Inventory: {', '.join(has_items)}")
-        
-        # High-confidence flags
-        true_flags = [flag for flag, p in self.flag_beliefs.items() if p > 0.7]
-        if true_flags:
-            lines.append(f"Known state: {', '.join(true_flags)}")
-        
-        # Accomplished goals
-        done_goals = [goal for goal, p in self.goal_beliefs.items() if p > 0.7]
-        if done_goals:
-            lines.append(f"Accomplished: {', '.join(done_goals)}")
-        
-        return "\n".join(lines) if lines else "No confident beliefs yet."
-```
-
-### Dynamics Model
-
-```python
-from dataclasses import dataclass, field
-from typing import Dict, Tuple, Optional, Set
-import hashlib
-
-@dataclass(frozen=True)
-class StateActionKey:
-    """Hashable key for state-action pairs."""
-    state_hash: str
-    action: str
-
-@dataclass
-class ObservedOutcome:
-    """What we observed when taking an action."""
-    next_state_hash: str
-    reward: float
-    observation_text: str  # For learning/debugging
-
 class DynamicsModel:
-    """
-    Learned dynamics from direct experience.
-    
-    In a deterministic game, one observation = certainty.
-    """
+    """Records observed outcomes. Deterministic game = one observation = certainty."""
     
     def __init__(self):
-        # (state, action) -> observed outcome
-        self.observations: Dict[StateActionKey, ObservedOutcome] = {}
-        
-        # Track which actions we've tried (regardless of state)
-        self.tried_actions: Set[str] = set()
-        
-        # Track total observations for stats
-        self.total_observations: int = 0
+        self.observations: Dict[Tuple[str, str], float] = {}  # (state, action) -> reward
     
-    def has_observation(self, state_hash: str, action: str) -> bool:
-        """Have we tried this action in this state?"""
-        key = StateActionKey(state_hash, action)
-        return key in self.observations
+    def record(self, state: str, action: str, reward: float):
+        self.observations[(state, action)] = reward
     
-    def get_observation(self, state_hash: str, action: str) -> Optional[ObservedOutcome]:
-        """Get observed outcome if we have one."""
-        key = StateActionKey(state_hash, action)
-        return self.observations.get(key)
+    def known_reward(self, state: str, action: str) -> Optional[float]:
+        return self.observations.get((state, action))
     
-    def record_observation(
-        self, 
-        state_hash: str, 
-        action: str, 
-        next_state_hash: str,
-        reward: float,
-        observation_text: str = "",
-    ):
-        """Record an observed outcome."""
-        key = StateActionKey(state_hash, action)
-        self.observations[key] = ObservedOutcome(
-            next_state_hash=next_state_hash,
-            reward=reward,
-            observation_text=observation_text,
-        )
-        self.tried_actions.add(action)
-        self.total_observations += 1
-    
-    def known_reward(self, state_hash: str, action: str) -> Optional[float]:
-        """
-        Get known reward for state-action pair.
-        
-        Returns None if we haven't observed this pair.
-        """
-        obs = self.get_observation(state_hash, action)
-        return obs.reward if obs else None
-    
-    def get_stats(self) -> dict:
-        return {
-            "total_observations": self.total_observations,
-            "unique_state_actions": len(self.observations),
-            "unique_actions_tried": len(self.tried_actions),
-        }
+    def is_known(self, state: str, action: str) -> bool:
+        return (state, action) in self.observations
 ```
 
----
-
-## The Agent
-
-### Value of Information
-
-For a question $Q$ about action $a'$:
-
-1. **Predict LLM response distribution:**
-   $$P(\text{yes}) = \text{TPR} \cdot b + \text{FPR} \cdot (1-b)$$
-   where $b = P(\text{true} | B)$ is current belief
-
-2. **Compute posterior beliefs for each answer:**
-   $$B_{\text{yes}} = \text{BayesUpdate}(B, \text{yes})$$
-   $$B_{\text{no}} = \text{BayesUpdate}(B, \text{no})$$
-
-3. **Compute best action under each posterior:**
-   $$a^*_{\text{yes}} = \arg\max_a \mathbb{E}[U(a) | B_{\text{yes}}]$$
-   $$a^*_{\text{no}} = \arg\max_a \mathbb{E}[U(a) | B_{\text{no}}]$$
-
-4. **Value of information:**
-   $$\text{VOI}(Q) = P(\text{yes}) \cdot \mathbb{E}[U(a^*_{\text{yes}}) | B_{\text{yes}}] + P(\text{no}) \cdot \mathbb{E}[U(a^*_{\text{no}}) | B_{\text{no}}] - \mathbb{E}[U(a^*) | B]$$
-
-This is the expected improvement in action value from asking. It's positive only when the answer might change which action is chosen.
+### UnifiedDecisionMaker
 
 ```python
 class UnifiedDecisionMaker:
-    """
-    Unified decision-making over game actions and LLM queries.
-    
-    Both action types evaluated by expected utility.
-    """
-    
-    def __init__(self, question_cost: float = 0.01):
-        """
-        Args:
-            question_cost: Cost c of asking one question (in reward units).
-                          Represents value of computation time.
-        """
+    """Choose between asking and acting via EU maximisation."""
+
+    def __init__(self, question_cost: float, action_cost: float):
         self.question_cost = question_cost
-    
+        self.action_cost = action_cost
+
     def choose(
         self,
-        game_actions: List[str],
-        possible_questions: List[Tuple[str, str]],  # (action, question)
-        beliefs: Dict[str, float],
+        state: str,
+        actions: List[str],
+        beliefs: Dict[str, Tuple[float, float]],  # action -> (α, β)
         sensor: BinarySensor,
-        dynamics: 'DynamicsModel',
-        state_hash: str,
-    ) -> Tuple[str, str]:
-        """
-        Choose between asking a question or taking a game action.
-        
-        Returns: (type, value) where type is 'ask' or 'take'
-        """
-        # Compute EU for all game actions
+        dynamics: DynamicsModel,
+    ) -> Tuple[str, Any]:  # ('ask', action) or ('take', action)
+
+        # Compute EU for each game action
         game_eus = {}
-        for action in game_actions:
-            known = dynamics.known_reward(state_hash, action)
+        n = len(actions)
+        for a in actions:
+            known = dynamics.known_reward(state, a)
             if known is not None:
-                game_eus[action] = known
+                game_eus[a] = known - self.action_cost
             else:
-                belief = beliefs.get(action, 0.5)
-                game_eus[action] = belief * 1.0  # EU = P(helps) * reward_if_helps
+                alpha, beta = beliefs.get(a, (1.0/n, 1.0 - 1.0/n))
+                game_eus[a] = alpha / (alpha + beta) - self.action_cost
         
-        best_game_action = max(game_actions, key=lambda a: game_eus[a])
-        best_game_eu = game_eus[best_game_action]
+        best_game_eu = max(game_eus.values())
+        best_game_action = max(actions, key=lambda a: game_eus[a])
         
-        # Compute EU for all questions (VOI - cost)
-        best_question = None
-        best_question_eu = float('-inf')
+        # Find best question (highest VOI)
+        best_voi = 0.0
+        best_question_action = None
         
-        for action, question in possible_questions:
-            # Skip if we already know outcome (no uncertainty to resolve)
-            if dynamics.has_observation(state_hash, action):
-                continue
-            
-            belief = beliefs.get(action, 0.5)
-            voi = self.compute_voi(action, belief, sensor, game_eus)
-            question_eu = voi - self.question_cost
-            
-            if question_eu > best_question_eu:
-                best_question_eu = question_eu
-                best_question = (action, question)
+        for a in actions:
+            if dynamics.is_known(state, a):
+                continue  # No point asking about known outcomes
+
+            alpha, beta = beliefs.get(a, (1.0/n, 1.0 - 1.0/n))
+            voi = self.compute_voi(a, alpha, beta, sensor, game_eus)
+            if voi > best_voi:
+                best_voi = voi
+                best_question_action = a
         
-        # Unified decision: take whichever has higher EU
-        if best_question is not None and best_question_eu > best_game_eu:
-            return ('ask', best_question)
+        # Decision: ask if VOI > cost
+        if best_question_action is not None and best_voi > self.question_cost:
+            return ('ask', best_question_action)
         else:
             return ('take', best_game_action)
     
     def compute_voi(
         self,
         action: str,
-        current_belief: float,
+        alpha: float,
+        beta: float,
         sensor: BinarySensor,
-        all_game_eus: Dict[str, float],
+        game_eus: Dict[str, float],
     ) -> float:
+        """Value of information for asking about action.
+
+        Uses Beta parameters (not just the mean) — two actions with the
+        same mean but different total counts have different VOI because
+        the uncertain one has more to learn from a question.
         """
-        Compute value of information for asking about this action.
-        
-        VOI = E[max EU after asking] - max EU now
-        """
-        current_best_eu = max(all_game_eus.values())
-        
+
+        belief = alpha / (alpha + beta)
+        current_best = max(game_eus.values())
+
         # P(LLM says yes)
-        p_yes = sensor.tpr * current_belief + sensor.fpr * (1 - current_belief)
-        p_no = 1 - p_yes
-        
-        # Posterior beliefs after each answer
-        posterior_if_yes = sensor.posterior(current_belief, said_yes=True)
-        posterior_if_no = sensor.posterior(current_belief, said_yes=False)
-        
-        # EU of this action under each posterior
-        eu_if_yes = posterior_if_yes * 1.0
-        eu_if_no = posterior_if_no * 1.0
-        
-        # Best EU achievable after each answer
-        other_best = max(
-            (eu for a, eu in all_game_eus.items() if a != action),
-            default=0.0
-        )
-        
-        best_eu_if_yes = max(eu_if_yes, other_best)
-        best_eu_if_no = max(eu_if_no, other_best)
-        
-        # Expected best EU after asking
-        expected_best_after = p_yes * best_eu_if_yes + p_no * best_eu_if_no
-        
-        # VOI = improvement over current best
-        voi = expected_best_after - current_best_eu
-        
-        return max(0.0, voi)
+        p_yes = sensor.tpr * belief + sensor.fpr * (1 - belief)
+
+        # Posteriors
+        post_yes = sensor.posterior(belief, True)
+        post_no = sensor.posterior(belief, False)
+
+        # EU of this action under each posterior (minus action_cost)
+        eu_yes = post_yes - self.action_cost
+        eu_no = post_no - self.action_cost
+
+        # Best EU after each answer (other actions unchanged)
+        other_best = max((eu for a, eu in game_eus.items() if a != action), default=0)
+        best_if_yes = max(eu_yes, other_best)
+        best_if_no = max(eu_no, other_best)
+
+        # Expected best after asking
+        expected_best = p_yes * best_if_yes + (1 - p_yes) * best_if_no
+
+        return max(0.0, expected_best - current_best)
 ```
 
-### The Agent
+### Agent
 
 ```python
-from jericho import FrotzEnv
-from typing import List, Dict, Tuple, Optional
-import hashlib
-
 class BayesianIFAgent:
+    """Bayesian IF agent. All decisions via EU maximisation.
+
+    Three families of Beta distributions, all learning from data:
+      1. Sensor TPR ~ Beta(α_tp, β_tp)
+      2. Sensor FPR ~ Beta(α_fp, β_fp)
+      3. Action belief ~ Beta(α_a, β_a) per action
+    Every belief is a distribution. Every distribution learns.
+    Every decision flows from these distributions via EU maximisation.
     """
-    Bayesian IF agent with LLM as queryable sensor bank.
-    
-    Unified decision-making: asking questions and taking game actions
-    are both evaluated by expected utility in the same framework.
-    
-    Core loop:
-    1. Generate possible questions and game actions
-    2. Compute EU for each (VOI - cost for questions, E[R] for game actions)
-    3. Choose argmax
-    4. If question: ask, update beliefs, repeat from 1
-    5. If game action: take it, observe outcome, learn
-    """
-    
-    def __init__(
-        self, 
-        llm_client,
-        question_cost: float = 0.01,
-    ):
-        """
-        Args:
-            llm_client: Client for LLM queries
-            question_cost: Cost of asking one question (in reward units).
-                          Represents value of computation time.
-        """
-        self.sensor_bank = LLMSensorBank(llm_client)
+
+    def __init__(self, llm_client, question_cost: float = 0.01,
+                 action_cost: float = 0.10):
+        self.llm = llm_client
+        self.sensor = BinarySensor()
         self.dynamics = DynamicsModel()
-        self.beliefs = BeliefState()
-        
-        self.decision_maker = UnifiedDecisionMaker(question_cost=question_cost)
-        
-        # Tracking
-        self.current_state_hash: Optional[str] = None
-        self.last_action: Optional[str] = None
-        self.last_llm_predictions: Dict[str, bool] = {}
-        
-        # Stats
-        self.total_questions_asked: int = 0
-        self.episode_count: int = 0
-    
-    def get_state_hash(self, env: FrotzEnv) -> str:
-        """Get hash of current game state."""
-        return str(env.get_world_state_hash())
-    
-    def choose_action(
-        self, 
-        env: FrotzEnv, 
-        observation: str,
-    ) -> Tuple[str, str]:
-        """
-        Choose action via unified expected utility maximisation.
-        
-        Returns: (action, explanation)
-        """
-        self.sensor_bank.clear_cache()
-        
-        state_hash = self.get_state_hash(env)
-        self.current_state_hash = state_hash
-        valid_actions = env.get_valid_actions() or ["look"]
-        
-        context = f"Observation: {observation[:500]}\n\n{self.beliefs.to_context_string()}"
-        
-        # Build current belief dict for actions
-        action_beliefs = {
-            a: self.beliefs.get_belief(a, "action", default=0.5)
-            for a in valid_actions
-        }
-        
-        sensor = self.sensor_bank.sensors[QuestionType.ACTION_HELPS]
-        
-        # Unified decision loop: ask or act?
+        self.decision_maker = UnifiedDecisionMaker(question_cost, action_cost)
+
+        self.beliefs: Dict[str, Tuple[float, float]] = {}  # action -> (α, β)
+        self.pending_predictions: Dict[str, bool] = {}  # action -> LLM said yes
+
+    def act(self, state: str, observation: str, actions: List[str]) -> str:
+        """Choose and return action to take."""
+
+        # Initialize beliefs for new actions
+        # Prior: Beta(1/N, 1 - 1/N) — mean 1/N, total count 1 (maximally weak).
+        # Derives from problem structure: ~1 action helps, don't know which.
+        n = len(actions)
+        for a in actions:
+            if a not in self.beliefs:
+                self.beliefs[a] = (1.0 / n, 1.0 - 1.0 / n)
+
+        # Decision loop: ask or act?
         while True:
-            # Generate possible questions
-            possible_questions = [
-                (a, f"Will the action '{a}' make meaningful progress toward winning the game?")
-                for a in valid_actions
-                if not self.dynamics.has_observation(state_hash, a)
-            ]
-            
-            # Unified decision
-            decision_type, decision_value = self.decision_maker.choose(
-                game_actions=valid_actions,
-                possible_questions=possible_questions,
-                beliefs=action_beliefs,
-                sensor=sensor,
-                dynamics=self.dynamics,
-                state_hash=state_hash,
+            decision, value = self.decision_maker.choose(
+                state, actions, self.beliefs, self.sensor, self.dynamics
             )
-            
-            if decision_type == 'take':
-                # Best choice is a game action
-                game_action = decision_value
-                eu = action_beliefs.get(game_action, 0.5)
-                known = self.dynamics.known_reward(state_hash, game_action)
-                if known is not None:
-                    explanation = f"EU={known:.3f} (known)"
-                else:
-                    explanation = f"EU={eu:.3f} (belief={action_beliefs.get(game_action, 0.5):.2f})"
-                
-                self.last_action = game_action
-                return game_action, explanation
-            
-            else:
-                # Best choice is to ask a question
-                action_to_ask, question = decision_value
-                
-                answer, _ = self.sensor_bank.ask(
-                    QuestionType.ACTION_HELPS, question, context
-                )
-                
-                # Update beliefs via Bayes
-                prior = action_beliefs[action_to_ask]
-                posterior = sensor.posterior(prior, answer)
-                action_beliefs[action_to_ask] = posterior
-                self.beliefs.update_belief(action_to_ask, "action", posterior)
-                
-                # Track for ground truth learning
-                self.last_llm_predictions[action_to_ask] = answer
-                
-                self.total_questions_asked += 1
-                
-                # Loop continues: re-evaluate whether to ask more or act
-    
-    def observe_outcome(
-        self,
-        env: FrotzEnv,
-        action: str,
-        observation: str,
-        reward: float,
-    ):
-        """
-        Learn from outcome.
-        
-        - Record in dynamics model
-        - Update sensor reliability from ground truth
-        """
-        next_state_hash = self.get_state_hash(env)
-        
+
+            if decision == 'take':
+                return value
+
+            # Ask question
+            action_to_ask = value
+            question = f"Will '{action_to_ask}' help make progress? YES or NO."
+            answer = self.llm.ask(question, observation)
+            said_yes = 'YES' in answer.upper()
+
+            # Update belief via Bayes' rule using sensor TPR/FPR,
+            # then approximate posterior as Beta (see § Prior Over Actions).
+            alpha, beta = self.beliefs[action_to_ask]
+            self.beliefs[action_to_ask] = self.update_belief_from_sensor(
+                alpha, beta, self.sensor, said_yes
+            )
+
+            # Record for ground truth learning
+            self.pending_predictions[action_to_ask] = said_yes
+
+    def observe(self, state: str, action: str, reward: float):
+        """Learn from outcome."""
+
         # Record dynamics
-        if self.current_state_hash:
-            self.dynamics.record_observation(
-                state_hash=self.current_state_hash,
-                action=action,
-                next_state_hash=next_state_hash,
-                reward=reward,
-                observation_text=observation[:200],
-            )
-        
-        # Learn sensor reliability from ground truth
-        # Did the action "help"? Define as: reward > 0 OR state changed
-        helped = reward > 0 or next_state_hash != self.current_state_hash
-        
-        # Update sensor for any predictions we made about this action
-        if action in self.last_llm_predictions:
-            llm_said_helps = self.last_llm_predictions[action]
-            self.sensor_bank.update_from_ground_truth(
-                QuestionType.ACTION_HELPS,
-                said_yes=llm_said_helps,
-                actual_truth=helped,
-            )
-        
-        # Clear predictions for next turn
-        self.last_llm_predictions = {}
-        
-        # Update beliefs based on outcome
-        # If we got reward, mark as success
-        if reward > 0:
-            self.beliefs.set_certain(action, "action", True)
-    
-    def play_episode(
-        self,
-        env: FrotzEnv,
-        max_steps: int = 100,
-        verbose: bool = False,
-    ) -> Dict:
-        """Play one episode."""
-        obs, info = env.reset()
-        total_reward = 0
-        steps = 0
-        
-        # Reset per-episode state (but keep learned dynamics and sensor reliability)
-        self.beliefs = BeliefState()
-        self.last_llm_predictions = {}
-        
-        if verbose:
-            print(f"\n{'='*60}")
-            print(f"Episode {self.episode_count + 1}")
-            print(f"{'='*60}")
-            print(obs[:400])
-        
-        while not env.game_over() and steps < max_steps:
-            # Choose action
-            action, explanation = self.choose_action(env, obs)
-            
-            if verbose:
-                print(f"\n> {action}")
-                print(f"  {explanation}")
-            
-            # Take action
-            old_score = env.get_score()
-            obs, reward, done, info = env.step(action)
-            new_score = env.get_score()
-            steps += 1
-            
-            if verbose and new_score > old_score:
-                print(f"  *** SCORE: {old_score} → {new_score} ***")
-            
-            # Observe outcome
-            self.observe_outcome(env, action, obs, reward)
-            
-            total_reward += reward
-        
-        self.episode_count += 1
-        
-        return {
-            "episode": self.episode_count,
-            "total_reward": total_reward,
-            "final_score": env.get_score(),
-            "steps": steps,
-            "questions_asked": self.total_questions_asked,
-            "dynamics_stats": self.dynamics.get_stats(),
-            "sensor_stats": self.sensor_bank.get_all_stats(),
-        }
-    
-    def play_multiple_episodes(
-        self,
-        game_path: str,
-        n_episodes: int = 10,
-        max_steps: int = 100,
-        verbose: bool = False,
-    ) -> List[Dict]:
-        """Play multiple episodes, learning across them."""
-        env = FrotzEnv(game_path)
-        results = []
-        
-        for i in range(n_episodes):
-            result = self.play_episode(
-                env, max_steps,
-                verbose=(verbose and i < 2)
-            )
-            results.append(result)
-            
-            # Print summary
-            sensor_stats = self.sensor_bank.sensors[QuestionType.ACTION_HELPS].get_stats()
-            print(f"Episode {i+1}: score={result['final_score']}, "
-                  f"steps={result['steps']}, "
-                  f"sensor_reliability={sensor_stats['reliability']:.2f}")
-        
-        # Final summary
-        scores = [r['final_score'] for r in results]
-        print(f"\n{'='*60}")
-        print(f"SUMMARY")
-        print(f"{'='*60}")
-        print(f"Scores: {scores}")
-        print(f"Mean: {sum(scores)/len(scores):.2f}, Max: {max(scores)}")
-        print(f"Total questions asked: {self.total_questions_asked}")
-        print(f"Dynamics: {self.dynamics.get_stats()}")
-        
-        for qt, sensor in self.sensor_bank.sensors.items():
-            stats = sensor.get_stats()
-            if stats['ground_truths'] > 0:
-                print(f"Sensor {qt.value}: TPR={stats['tpr']:.2f}, FPR={stats['fpr']:.2f}, n={stats['ground_truths']}")
-        
-        return results
+        self.dynamics.record(state, action, reward)
+
+        # Update sensor from ground truth
+        helped = reward > 0  # Strict: only score counts
+
+        if action in self.pending_predictions:
+            said_yes = self.pending_predictions[action]
+            self.sensor.update(said_yes, helped)
+            del self.pending_predictions[action]
+
+        # Update action belief from ground truth (exact conjugate update)
+        if action in self.beliefs:
+            alpha, beta = self.beliefs[action]
+            if helped:
+                self.beliefs[action] = (alpha + 1, beta)
+            else:
+                self.beliefs[action] = (alpha, beta + 1)
 ```
 
 ---
 
-## Ollama Client
+## Parameters
 
-```python
-import requests
-import json
-from dataclasses import dataclass
-from typing import Optional
+| Parameter | Value | Derivation |
+|-----------|-------|------------|
+| question_cost | 0.01 | ~1% of max reward. Asking is cheap but not free. |
+| action_cost | 0.10 | Opportunity cost of a game turn. Derived from finite horizon: each wasted turn forfeits ~1/T of remaining achievable score. |
+| prior P(helps) | Beta(1/N, 1−1/N) | Mean 1/N (one action helps, don't know which), total count 1 (maximally weak). Derived from problem structure. |
+| TPR prior | Beta(2, 1) | Expect LLM is somewhat reliable (mean 0.67). |
+| FPR prior | Beta(1, 2) | Expect LLM doesn't say yes to everything (mean 0.33). |
 
-@dataclass
-class OllamaConfig:
-    model: str = "llama3.1:8b"
-    base_url: str = "http://localhost:11434"
-    temperature: float = 0.1
-    timeout: int = 30
+These can be tuned. But they must be justified, not arbitrary.
 
-class OllamaClient:
-    """Client for local Ollama instance."""
-    
-    def __init__(self, config: OllamaConfig = None):
-        self.config = config or OllamaConfig()
-    
-    def complete(self, prompt: str) -> str:
-        response = requests.post(
-            f"{self.config.base_url}/api/generate",
-            json={
-                "model": self.config.model,
-                "prompt": prompt,
-                "temperature": self.config.temperature,
-                "stream": False,
-            },
-            timeout=self.config.timeout,
-        )
-        response.raise_for_status()
-        return response.json()["response"]
-```
+### Model Agnosticism
+
+The Bayesian framework is model-agnostic — it learns any sensor's reliability from data. Default: any instruction-following LLM via Ollama (e.g. llama3.1 8b, 70b, etc). A larger model may start with better TPR/FPR, but the agent will learn either way. The math doesn't care what's behind the sensor.
 
 ---
 
-## Runner
+## Debugging Checklist
 
-```python
-#!/usr/bin/env python3
-"""
-Run the Bayesian IF agent.
+If agent behaves badly:
 
-Usage:
-    python runner.py [game_path] [--episodes N] [--verbose]
+1. **Is VOI being computed correctly?** Print VOI for each potential question.
 
-Prerequisites:
-    1. ollama serve
-    2. ollama pull llama3.1:8b
-"""
+2. **Is the comparison right?** Ask if VOI > cost, not if (VOI - cost) > game_eu.
 
-import argparse
-import sys
+3. **Are beliefs reasonable?** Print P(helps) for actions. Should be ~1/N initially (Beta prior mean).
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("game", nargs="?", default="games/905.z5")
-    parser.add_argument("--episodes", type=int, default=10)
-    parser.add_argument("--max-steps", type=int, default=100)
-    parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--model", default="llama3.1:8b")
-    args = parser.parse_args()
-    
-    # Check Ollama
-    import requests
-    try:
-        requests.get("http://localhost:11434/api/tags", timeout=5)
-    except:
-        print("ERROR: Ollama not running. Start with: ollama serve")
-        sys.exit(1)
-    
-    from agent import BayesianIFAgent, OllamaClient, OllamaConfig
-    
-    config = OllamaConfig(model=args.model)
-    client = OllamaClient(config)
-    agent = BayesianIFAgent(client)
-    
-    results = agent.play_multiple_episodes(
-        game_path=args.game,
-        n_episodes=args.episodes,
-        max_steps=args.max_steps,
-        verbose=args.verbose,
-    )
-    
-    import json
-    with open("results.json", "w") as f:
-        json.dump(results, f, indent=2, default=str)
+4. **Is ground truth correct?** Only reward > 0 counts. Not state change.
 
-if __name__ == "__main__":
-    main()
-```
+5. **Is the LLM being queried?** If VOI > cost, questions should happen.
 
----
+6. **What does the LLM say?** Maybe it's wrong. Check actual responses.
 
-## Why This Fixes Loops
-
-No loop detection needed. Here's why:
-
-1. Agent tries "look under bed" in state S
-2. Gets reward 0, state doesn't change
-3. Dynamics model records: (S, "look under bed") → reward=0
-4. Next turn, in same state S
-5. EU("look under bed") = known_reward = 0
-6. EU(any untried action) = P(helps) × 1 + P(doesn't) × 0 = P(helps) > 0 (unless P(helps) = 0)
-7. Agent picks untried action
-
-The loop never forms because **repeating a known-futile action has EU=0**, while **untried actions have EU = P(helps) > 0** (assuming non-zero prior).
-
-No hack. Just rational expected utility maximisation.
-
----
-
-## Why Sensor Reliability Matters
-
-If the LLM always said "yes, every action helps" (high FPR), the agent would learn this:
-- FPR increases toward 1.0
-- Sensor reliability = TPR - FPR → 0 or negative
-- Posteriors barely update from LLM answers
-- Agent falls back to prior beliefs + dynamics
-
-If the LLM is actually helpful (high TPR, low FPR):
-- Reliability stays high
-- LLM answers meaningfully update beliefs
-- Agent focuses on promising actions
-
-The agent automatically learns how much to trust the oracle.
-
----
-
-## Key Properties
-
-1. **Unified decision space**: Asking questions and taking game actions evaluated in same EU framework
-2. **Direct experience dominates**: Once observed, no uncertainty
-3. **All decisions are EU maximisation**: No hacks, no overrides
-4. **Questions asked rationally**: Only when VOI - cost > best game action EU
-5. **Sensor reliability is learned**: Agent discovers how much to trust LLM
-6. **No loops possible**: Known-futile actions have EU=0, untried have EU=P(helps)>0
-7. **Exploration emerges naturally**: Uncertainty gives higher EU than known-bad outcomes
-
----
-
-## Metrics to Track
-
-- **Score per episode**: Are we improving?
-- **Sensor TPR/FPR**: Is the LLM reliable? Are we learning its reliability?
-- **Questions per turn**: How many questions before acting?
-- **Question cost sensitivity**: How does varying $c$ affect behaviour?
-- **Unique state-actions observed**: Coverage of dynamics
-- **Decision explanations**: How often "ask" vs "take"? How often "known" vs "belief"?
+**Never:** Add a hack to fix symptoms. Find the root cause.
 
 ---
 
 ## Success Criteria
 
-1. **No loops**: Agent never repeats futile actions
-2. **Sensor learning**: TPR/FPR converge to true reliability
-3. **Rational questioning**: Asks when valuable, acts when not
-4. **Exploration**: Agent tries diverse actions, doesn't get stuck
-5. **Score improvement**: Later episodes better than earlier
-6. **Principled**: All behaviour explainable via EU maximisation
+1. **Agent asks questions** when VOI > cost
+2. **Beliefs update** from LLM answers
+3. **Sensor reliability learned** from outcomes
+4. **No loops** — if cycling, agent asks LLM and learns those actions don't help
+5. **All behavior explainable** via EU maximisation
