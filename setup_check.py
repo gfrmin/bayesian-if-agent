@@ -15,14 +15,12 @@ def check_dependencies():
 
     errors = []
 
-    # Check jericho
     try:
         import jericho
         print(f"  jericho {jericho.__version__}")
     except ImportError as e:
         errors.append(f"  jericho not installed: {e}")
 
-    # Check requests
     try:
         import requests
         print(f"  requests {requests.__version__}")
@@ -52,8 +50,8 @@ def check_ollama():
             print(f"    - {m.get('name', 'unknown')}")
         return True
     except Exception:
-        print("  Ollama not running (oracle will be disabled)")
-        print("    To enable: ollama serve && ollama pull llama3.1:8b")
+        print("  Ollama not running (sensor bank will be disabled)")
+        print("    To enable: ollama serve && ollama pull llama3.1:latest")
         return False
 
 
@@ -80,50 +78,35 @@ def quick_demo(game_path: str = "games/905.z5"):
 
     from jericho import FrotzEnv
 
-    # Test basic game interaction
     print("\nTesting Jericho game interface...")
     env = FrotzEnv(game_path)
-    obs, info = env.reset()
+    obs, _info = env.reset()
 
     print(f"\nGame loaded: {game_path}")
     print(f"Initial observation:\n{obs[:300]}...")
     print(f"\nScore: {env.get_score()}/{env.get_max_score()}")
     print(f"Valid actions: {env.get_valid_actions()[:5]}...")
 
-    # Test agent
     print("\n" + "-" * 40)
-    print("Testing Bayesian agent (v3)...")
+    print("Testing Bayesian agent (v4)...")
 
-    from core import BayesianIFAgent
-    from runner import extract_beliefs_data
+    from runner import BayesianIFAgent
 
-    agent = BayesianIFAgent(exploration_rate=0.2)
-    data = extract_beliefs_data(env)
-    agent.update_beliefs_from_ground_truth(
-        data["location"], data["location_id"],
-        data["inventory"], data["world_hash"],
-    )
+    agent = BayesianIFAgent()
 
-    print(f"Beliefs: {agent.beliefs.to_prompt_context()}")
+    print(f"Beliefs: {agent.beliefs.to_context_string()}")
 
-    # Take a few actions
     print("\nTaking a few actions...")
     for i in range(3):
-        valid = env.get_valid_actions()
-        action = agent.choose_action(obs, valid or ["look"])
+        action, explanation = agent.choose_action(env, obs)
 
         old_score = env.get_score()
-        obs, reward, done, info = env.step(action)
+        obs, reward, done, _info = env.step(action)
         new_score = env.get_score()
 
-        data = extract_beliefs_data(env)
-        agent.update_beliefs_from_ground_truth(
-            data["location"], data["location_id"],
-            data["inventory"], data["world_hash"],
-        )
-        agent.observe_outcome(obs, reward, new_score)
+        agent.observe_outcome(env, action, obs, reward)
 
-        print(f"  {i+1}. '{action}' -> score: {new_score}, location: {agent.beliefs.location}")
+        print(f"  {i+1}. '{action}' ({explanation}) -> score: {new_score}")
 
         if done:
             break
@@ -140,24 +123,20 @@ def quick_demo(game_path: str = "games/905.z5"):
 
 def main():
     print("=" * 60)
-    print("Bayesian IF Agent v3 - Setup Verification")
+    print("Bayesian IF Agent v4 - Setup Verification")
     print("=" * 60)
 
-    # Check dependencies
     if not check_dependencies():
         print("\nPlease install missing dependencies and try again.")
         sys.exit(1)
 
-    # Check Ollama
     check_ollama()
 
-    # Check game file
     game_path = "games/905.z5"
     if not check_game_file(game_path):
         print("\nPlease download a game file and try again.")
         sys.exit(1)
 
-    # Run demo
     quick_demo(game_path)
 
 

@@ -1,10 +1,12 @@
-# Adaptive Bayesian IF Agent: Specification v3
+# Adaptive Bayesian IF Agent: Specification v4
 
 ## The Core Insight
 
-The LLM is an **oracle** we can query about anything. We've been asking narrow questions ("rate these actions"). We should ask rich questions ("help me understand the situation").
+The LLM is a **queryable sensor bank**. We can ask it anything. To use its answers as proper Bayesian evidence, we restrict outputs to simple forms (yes/no) and learn the sensor's reliability from experience.
 
-The agent maintains beliefs. The LLM helps refine them. The agent decides.
+The agent is an **expected utility maximiser**. Every action choice is argmax E[U]. No hacks, no overrides, no "follow the oracle X% of the time."
+
+Direct experience dominates. In a deterministic game, once you've observed an outcome, there's no uncertainty. The LLM's opinion becomes irrelevant for that state-action pair.
 
 ---
 
@@ -12,883 +14,859 @@ The agent maintains beliefs. The LLM helps refine them. The agent decides.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                           GAME (Jericho)                            │
-│        Provides: observations, rewards, valid_actions               │
+│                              GAME                                   │
+│                                                                     │
+│  Observations: text, score, valid_actions                           │
+│  Ground truth: outcomes of actions (deterministic)                  │
 └──────────────────────────────────┬──────────────────────────────────┘
                                    │
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                      AGENT'S BELIEF STATE                           │
+│                      LLM SENSOR BANK                                │
 │                                                                     │
-│  • Current location                                                 │
-│  • Inventory                                                        │
-│  • Accomplished goals                                               │
-│  • Failed actions (with reasons)                                    │
-│  • Current goal                                                     │
-│  • Blocking conditions                                              │
-│  • Tracked state variables                                          │
-│  • Dynamics model P(s', r | s, a)                                   │
-│  • LLM reliability estimates                                        │
+│  Binary questions with learned reliability:                         │
+│                                                                     │
+│  ┌─────────────────────┐  ┌─────────────────────┐                   │
+│  │ "Will X help?"      │  │ "Am I in location?" │                   │
+│  │ TPR: 0.65 FPR: 0.30 │  │ TPR: 0.85 FPR: 0.10 │                   │
+│  └─────────────────────┘  └─────────────────────┘                   │
+│                                                                     │
+│  ┌─────────────────────┐  ┌─────────────────────┐                   │
+│  │ "Do I have item?"   │  │ "Is goal done?"     │                   │
+│  │ TPR: 0.80 FPR: 0.15 │  │ TPR: 0.60 FPR: 0.25 │                   │
+│  └─────────────────────┘  └─────────────────────┘                   │
+│                                                                     │
+│  Agent can ask ANY question. Learns reliability from ground truth.  │
 └──────────────────────────────────┬──────────────────────────────────┘
                                    │
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                      LLM ORACLE (Ollama/Llama3.1)                   │
+│                      BELIEF STATE                                   │
 │                                                                     │
-│  We can ask ANYTHING:                                               │
-│  • What's the goal?                                                 │
-│  • What have I accomplished?                                        │
-│  • What's blocking me?                                              │
-│  • What action should I take and why?                               │
-│  • What state variables matter?                                     │
-│  • Did that action make progress?                                   │
-│  • Why did that action fail?                                        │
+│  P(in_bedroom) = 0.9                                                │
+│  P(have_keys) = 0.3                                                 │
+│  P(phone_answered) = 0.8                                            │
+│  P(action_X_helps) = 0.6                                            │
+│  ...                                                                │
 │                                                                     │
-│  Input: observation + agent's beliefs + specific questions          │
-│  Output: structured understanding (as observations to condition on) │
+│  Updated via Bayes' rule from:                                      │
+│  - LLM sensor readings (weighted by learned reliability)            │
+│  - Direct observations from game                                    │
+│  - Action outcomes (deterministic → certainty)                      │
 └──────────────────────────────────┬──────────────────────────────────┘
                                    │
                                    ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                      BAYESIAN DECISION MAKING                       │
+│                      DYNAMICS MODEL                                 │
 │                                                                     │
-│  • Update beliefs from LLM outputs (weighted by reliability)        │
-│  • Select actions to maximise expected utility                      │
-│  • Decide whether to expand state representation                    │
-│  • Decide how much to deliberate                                    │
+│  For each (state, action) we've tried:                              │
+│  - Observed outcome (next_state, reward)                            │
+│  - Observation count                                                │
+│                                                                     │
+│  Deterministic game → 1 observation = certainty                     │
+└──────────────────────────────────┬──────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                      EXPECTED UTILITY MAXIMISER                     │
+│                                                                     │
+│  For each action:                                                   │
+│    If observed before: E[U] = observed_reward (certain)             │
+│    If not observed: E[U] = belief_weighted_estimate + info_value    │
+│                                                                     │
+│  Choose: argmax E[U]                                                │
+│                                                                     │
+│  No hacks. No overrides. Just expected utility.                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Core Principle: LLM as Oracle
+## Core Principles
 
-The LLM is not the agent. The LLM is an oracle that can answer questions about:
+### 1. The LLM is a Sensor with Learnable Reliability
 
-| Question Type | Example | Use |
-|--------------|---------|-----|
-| Goal inference | "What is the objective here?" | Orient planning |
-| Progress tracking | "What has been accomplished?" | Avoid repeating |
-| Blocker analysis | "Why did 'go east' fail?" | Understand dependencies |
-| Action recommendation | "What should I do next?" | Guide exploration |
-| State suggestion | "What variables matter?" | Inform representation |
-| Progress detection | "Did that action help?" | Learn what works |
-| Explanation | "What does this text mean?" | Parse complex situations |
+We can ask the LLM any yes/no question. Its answers are evidence, not truth.
 
-All answers are **observations** — data to condition on, weighted by learned reliability.
+For each question type, we learn:
+- **TPR**: P(LLM says Yes | actually Yes)
+- **FPR**: P(LLM says Yes | actually No)
+
+We learn these from ground truth:
+- Direct game feedback ("You're in the kitchen" when LLM said bedroom)
+- Action outcomes (LLM said "X will help", we tried X, it didn't)
+
+### 2. Direct Experience is Certain
+
+The game is deterministic. If we tried action A in state S and got outcome O, we **know** that's what happens. No uncertainty. No need to ask the LLM.
+
+P(outcome = O | state S, action A, already observed O) = 1.0
+
+### 3. Every Decision is Expected Utility Maximisation
+
+No special cases. No "follow oracle 70% of time". No "loop detection".
+
+```
+action* = argmax_a E[U | state, action, all_evidence]
+```
+
+Where all_evidence includes:
+- Direct observations from game
+- Previous action outcomes  
+- LLM sensor readings (weighted by reliability)
+
+### 4. Unified Decision Space
+
+The agent chooses between two types of actions:
+- `take(A)` — take game action A, receive reward, advance game
+- `ask(Q)` — ask question Q to the LLM, update beliefs, no game reward
+
+Both are evaluated in the same framework:
+
+**For game actions:**
+$$\mathbb{E}[U | \text{take}(A)] = \mathbb{E}[R | A, \text{beliefs}]$$
+
+**For questions:**
+$$\mathbb{E}[U | \text{ask}(Q)] = \text{VOI}(Q) - c$$
+
+Where VOI(Q) is the expected improvement in subsequent action value from learning the answer, and $c$ is the cost of asking.
+
+**The decision:**
+$$\text{action}^* = \arg\max \left( \max_A \mathbb{E}[U | \text{take}(A)], \max_Q \mathbb{E}[U | \text{ask}(Q)] \right)$$
+
+If a question's VOI minus cost exceeds all game actions' EU, ask first. Otherwise, act.
+
+### 5. The Cost of Asking
+
+The cost $c$ is real, not a hack. It represents the value of computation time.
+
+Even with a local LLM, asking takes wall-clock time. The agent exists in the real world where time has value. The parameter $c$ answers: "how much reward would I trade to save one LLM query?"
+
+- $c = 0$: Ask until VOI = 0 (unbounded questions if VOI never exactly zero)
+- $c > 0$: Ask less, act sooner
+- $c$ large: Almost never ask, rely on priors and experience
+
+The right $c$ depends on context. For a game we'll play many times, $c$ can be small (information is valuable). For a one-shot situation, $c$ might be larger.
+
+### 6. No Exploration Bonus Needed
+
+For untried actions, expected utility comes from beliefs:
+
+$$\mathbb{E}[U | \text{untried}] = P(\text{helps}) \times R_{\text{success}} + P(\text{doesn't}) \times R_{\text{fail}}$$
+
+For tried actions in a deterministic game, expected utility is the known outcome:
+
+$$\mathbb{E}[U | \text{tried}] = R_{\text{observed}}$$
+
+If we tried an action and got 0, its EU is 0. If we haven't tried an action and believe P(helps) = 0.5, its EU is 0.5. The untried action wins.
+
+**No exploration bonus needed.** Uncertainty itself gives higher expected value (when there's a chance of positive reward). The agent naturally explores because unknown actions have higher expected utility than known-bad actions.
 
 ---
 
 ## Data Structures
 
-### Agent's Belief State
+### Binary Sensor
+
+```python
+from dataclasses import dataclass
+import math
+
+@dataclass
+class BinarySensor:
+    """
+    A yes/no sensor with learned reliability.
+    
+    Models P(sensor_output | truth) as Beta distributions.
+    """
+    
+    # True positive: P(says Yes | actually Yes)
+    tp_alpha: float = 7.0   # Prior: ~70% TPR
+    tp_beta: float = 3.0
+    
+    # False positive: P(says Yes | actually No)
+    fp_alpha: float = 3.0   # Prior: ~30% FPR
+    fp_beta: float = 7.0
+    
+    # Query count (for diagnostics)
+    query_count: int = 0
+    ground_truth_count: int = 0
+    
+    @property
+    def tpr(self) -> float:
+        """Expected true positive rate."""
+        return self.tp_alpha / (self.tp_alpha + self.tp_beta)
+    
+    @property
+    def fpr(self) -> float:
+        """Expected false positive rate."""
+        return self.fp_alpha / (self.fp_alpha + self.fp_beta)
+    
+    @property
+    def reliability(self) -> float:
+        """Overall reliability score."""
+        return self.tpr - self.fpr  # Ranges from -1 to 1
+    
+    def update(self, said_yes: bool, was_true: bool):
+        """
+        Update reliability from ground truth.
+        
+        Called when we discover the actual truth.
+        """
+        self.ground_truth_count += 1
+        
+        if was_true:
+            if said_yes:
+                self.tp_alpha += 1  # True positive
+            else:
+                self.tp_beta += 1   # False negative
+        else:
+            if said_yes:
+                self.fp_alpha += 1  # False positive
+            else:
+                self.fp_beta += 1   # True negative
+    
+    def posterior(self, prior: float, said_yes: bool) -> float:
+        """
+        P(true | LLM response) via Bayes' rule.
+        
+        Args:
+            prior: P(true) before observing LLM response
+            said_yes: Whether LLM said yes
+        
+        Returns:
+            P(true | LLM response)
+        """
+        if said_yes:
+            # P(true | yes) = P(yes | true) P(true) / P(yes)
+            p_yes_if_true = self.tpr
+            p_yes_if_false = self.fpr
+            
+            numerator = p_yes_if_true * prior
+            denominator = p_yes_if_true * prior + p_yes_if_false * (1 - prior)
+        else:
+            # P(true | no) = P(no | true) P(true) / P(no)
+            p_no_if_true = 1 - self.tpr
+            p_no_if_false = 1 - self.fpr
+            
+            numerator = p_no_if_true * prior
+            denominator = p_no_if_true * prior + p_no_if_false * (1 - prior)
+        
+        if denominator == 0:
+            return prior
+        
+        return numerator / denominator
+    
+    def get_stats(self) -> dict:
+        return {
+            "tpr": self.tpr,
+            "fpr": self.fpr,
+            "reliability": self.reliability,
+            "queries": self.query_count,
+            "ground_truths": self.ground_truth_count,
+        }
+```
+
+### Sensor Bank
+
+```python
+from typing import Dict, Tuple, Optional
+from enum import Enum
+
+class QuestionType(Enum):
+    ACTION_HELPS = "action_helps"       # "Will action X make progress?"
+    IN_LOCATION = "in_location"         # "Am I in the bedroom?"
+    HAVE_ITEM = "have_item"             # "Do I have the keys?"
+    STATE_FLAG = "state_flag"           # "Is the door locked?"
+    GOAL_DONE = "goal_done"             # "Have I answered the phone?"
+    PREREQ_MET = "prereq_met"           # "Can I go east?"
+    ACTION_POSSIBLE = "action_possible" # "Is 'open door' available?"
+
+class LLMSensorBank:
+    """
+    The LLM as a collection of binary sensors.
+    
+    Each question type has independently learned reliability.
+    """
+    
+    def __init__(self, llm_client):
+        self.llm = llm_client
+        
+        # Initialize sensors with different priors based on expected reliability
+        self.sensors: Dict[QuestionType, BinarySensor] = {
+            QuestionType.ACTION_HELPS: BinarySensor(tp_alpha=6, tp_beta=4, fp_alpha=3, fp_beta=7),
+            QuestionType.IN_LOCATION: BinarySensor(tp_alpha=8, tp_beta=2, fp_alpha=1, fp_beta=9),
+            QuestionType.HAVE_ITEM: BinarySensor(tp_alpha=8, tp_beta=2, fp_alpha=1, fp_beta=9),
+            QuestionType.STATE_FLAG: BinarySensor(tp_alpha=6, tp_beta=4, fp_alpha=2, fp_beta=8),
+            QuestionType.GOAL_DONE: BinarySensor(tp_alpha=6, tp_beta=4, fp_alpha=2, fp_beta=8),
+            QuestionType.PREREQ_MET: BinarySensor(tp_alpha=5, tp_beta=5, fp_alpha=3, fp_beta=7),
+            QuestionType.ACTION_POSSIBLE: BinarySensor(tp_alpha=7, tp_beta=3, fp_alpha=2, fp_beta=8),
+        }
+        
+        # Cache to avoid redundant queries within same turn
+        self.query_cache: Dict[str, bool] = {}
+    
+    def ask(
+        self, 
+        question_type: QuestionType, 
+        question: str,
+        context: str = "",
+    ) -> Tuple[bool, float]:
+        """
+        Ask a yes/no question.
+        
+        Returns: (answer, posterior_multiplier)
+        
+        The posterior_multiplier indicates how much to update beliefs:
+        - High reliability sensor saying yes → large positive update
+        - Low reliability sensor → small update
+        """
+        cache_key = f"{question_type.value}:{question}"
+        
+        if cache_key in self.query_cache:
+            return self.query_cache[cache_key], self.sensors[question_type].reliability
+        
+        # Query the LLM
+        answer = self._query_llm(question, context)
+        
+        # Update query count
+        self.sensors[question_type].query_count += 1
+        
+        # Cache result
+        self.query_cache[cache_key] = answer
+        
+        return answer, self.sensors[question_type].reliability
+    
+    def update_from_ground_truth(
+        self, 
+        question_type: QuestionType, 
+        said_yes: bool, 
+        actual_truth: bool,
+    ):
+        """
+        Update sensor reliability from observed ground truth.
+        """
+        self.sensors[question_type].update(said_yes, actual_truth)
+    
+    def get_posterior(
+        self,
+        question_type: QuestionType,
+        prior: float,
+        said_yes: bool,
+    ) -> float:
+        """
+        Compute posterior probability given sensor reading.
+        """
+        return self.sensors[question_type].posterior(prior, said_yes)
+    
+    def clear_cache(self):
+        """Clear query cache (call at start of each turn)."""
+        self.query_cache = {}
+    
+    def _query_llm(self, question: str, context: str) -> bool:
+        """
+        Query LLM for yes/no answer.
+        """
+        prompt = f"""Answer this question about a text adventure game with only YES or NO.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer (YES or NO):"""
+        
+        response = self.llm.complete(prompt).strip().upper()
+        
+        return response.startswith("YES")
+    
+    def get_all_stats(self) -> Dict[str, dict]:
+        return {qt.value: sensor.get_stats() for qt, sensor in self.sensors.items()}
+```
+
+### Belief State
 
 ```python
 from dataclasses import dataclass, field
-from typing import Dict, List, Set, Optional, Any
-from collections import defaultdict
+from typing import Dict, List, Set, Any, Optional
 
 @dataclass
-class AgentBeliefs:
+class BeliefState:
     """
-    Everything the agent believes about the current situation.
+    Agent's beliefs as probability distributions.
     
-    This gets passed to the LLM for context.
-    This gets updated based on LLM responses.
-    """
-    
-    # Current state
-    location: str = "unknown"
-    inventory: List[str] = field(default_factory=list)
-    
-    # Goal tracking
-    overall_goal: str = "unknown"
-    current_subgoal: str = "unknown"
-    accomplished: List[str] = field(default_factory=list)
-    
-    # Blocker tracking
-    blocking_condition: Optional[str] = None
-    failed_actions: Dict[str, str] = field(default_factory=dict)  # action -> reason
-    
-    # State variables we're tracking
-    tracked_state: Dict[str, Any] = field(default_factory=dict)
-    
-    # History
-    action_history: List[str] = field(default_factory=list)
-    observation_history: List[str] = field(default_factory=list)
-    
-    def to_prompt_context(self) -> str:
-        """Format beliefs for inclusion in LLM prompt."""
-        sections = []
-        
-        sections.append(f"LOCATION: {self.location}")
-        sections.append(f"INVENTORY: {', '.join(self.inventory) if self.inventory else 'empty'}")
-        sections.append(f"OVERALL GOAL: {self.overall_goal}")
-        sections.append(f"CURRENT SUBGOAL: {self.current_subgoal}")
-        
-        if self.accomplished:
-            sections.append(f"ACCOMPLISHED: {', '.join(self.accomplished)}")
-        
-        if self.blocking_condition:
-            sections.append(f"BLOCKED BY: {self.blocking_condition}")
-        
-        if self.failed_actions:
-            failed = [f"'{a}' ({r})" for a, r in list(self.failed_actions.items())[-5:]]
-            sections.append(f"RECENT FAILURES: {'; '.join(failed)}")
-        
-        if self.tracked_state:
-            state_str = ', '.join(f"{k}={v}" for k, v in self.tracked_state.items())
-            sections.append(f"TRACKED STATE: {state_str}")
-        
-        if self.action_history:
-            recent = self.action_history[-10:]
-            sections.append(f"RECENT ACTIONS: {' → '.join(recent)}")
-        
-        return '\n'.join(sections)
-
-
-@dataclass
-class SituationUnderstanding:
-    """
-    LLM's analysis of the current situation.
-    
-    This is an OBSERVATION — data to condition on.
+    Each belief is a probability that something is true.
+    Updated via Bayes' rule from sensor readings and direct observations.
     """
     
-    # Goal understanding
-    overall_goal: Optional[str] = None
-    immediate_goal: Optional[str] = None
+    # Location belief: P(in_location_X) for each location
+    location_beliefs: Dict[str, float] = field(default_factory=dict)
+    current_location: Optional[str] = None  # Most likely location
     
-    # Progress understanding
-    accomplished: List[str] = field(default_factory=list)
-    progress_made: bool = False
+    # Inventory beliefs: P(have_item_X)
+    inventory_beliefs: Dict[str, float] = field(default_factory=dict)
     
-    # Blocker understanding
-    blocking_condition: Optional[str] = None
-    blocking_reason: Optional[str] = None
+    # State flag beliefs: P(flag_X_is_true)
+    flag_beliefs: Dict[str, float] = field(default_factory=dict)
     
-    # Action recommendation
-    recommended_action: Optional[str] = None
-    action_reasoning: Optional[str] = None
-    alternative_actions: List[str] = field(default_factory=list)
+    # Goal beliefs: P(goal_X_accomplished)
+    goal_beliefs: Dict[str, float] = field(default_factory=dict)
     
-    # State suggestions
-    important_state_variables: List[str] = field(default_factory=list)
+    # Action value beliefs: P(action_X_will_help)
+    action_beliefs: Dict[str, float] = field(default_factory=dict)
     
-    # Confidence (self-reported by LLM, take with grain of salt)
-    confidence: float = 0.5
+    def update_belief(self, belief_name: str, category: str, new_probability: float):
+        """Update a belief to a new probability."""
+        if category == "location":
+            self.location_beliefs[belief_name] = new_probability
+            # Update current_location to most likely
+            if self.location_beliefs:
+                self.current_location = max(self.location_beliefs, key=self.location_beliefs.get)
+        elif category == "inventory":
+            self.inventory_beliefs[belief_name] = new_probability
+        elif category == "flag":
+            self.flag_beliefs[belief_name] = new_probability
+        elif category == "goal":
+            self.goal_beliefs[belief_name] = new_probability
+        elif category == "action":
+            self.action_beliefs[belief_name] = new_probability
     
-    @classmethod
-    def from_json(cls, data: Dict) -> 'SituationUnderstanding':
-        """Parse from LLM JSON response."""
-        return cls(
-            overall_goal=data.get("overall_goal"),
-            immediate_goal=data.get("immediate_goal"),
-            accomplished=data.get("accomplished", []),
-            progress_made=data.get("progress_made", False),
-            blocking_condition=data.get("blocking_condition"),
-            blocking_reason=data.get("blocking_reason"),
-            recommended_action=data.get("recommended_action"),
-            action_reasoning=data.get("action_reasoning"),
-            alternative_actions=data.get("alternative_actions", []),
-            important_state_variables=data.get("important_state_variables", []),
-            confidence=data.get("confidence", 0.5),
-        )
+    def get_belief(self, belief_name: str, category: str, default: float = 0.5) -> float:
+        """Get current belief probability."""
+        if category == "location":
+            return self.location_beliefs.get(belief_name, default)
+        elif category == "inventory":
+            return self.inventory_beliefs.get(belief_name, default)
+        elif category == "flag":
+            return self.flag_beliefs.get(belief_name, default)
+        elif category == "goal":
+            return self.goal_beliefs.get(belief_name, default)
+        elif category == "action":
+            return self.action_beliefs.get(belief_name, default)
+        return default
+    
+    def set_certain(self, belief_name: str, category: str, value: bool):
+        """Set a belief to certainty (from direct observation)."""
+        self.update_belief(belief_name, category, 1.0 if value else 0.0)
+    
+    def to_context_string(self) -> str:
+        """Format beliefs for LLM context."""
+        lines = []
+        
+        if self.current_location:
+            lines.append(f"Location: {self.current_location} (confidence: {self.location_beliefs.get(self.current_location, 0):.0%})")
+        
+        # High-confidence inventory
+        has_items = [item for item, p in self.inventory_beliefs.items() if p > 0.7]
+        if has_items:
+            lines.append(f"Inventory: {', '.join(has_items)}")
+        
+        # High-confidence flags
+        true_flags = [flag for flag, p in self.flag_beliefs.items() if p > 0.7]
+        if true_flags:
+            lines.append(f"Known state: {', '.join(true_flags)}")
+        
+        # Accomplished goals
+        done_goals = [goal for goal, p in self.goal_beliefs.items() if p > 0.7]
+        if done_goals:
+            lines.append(f"Accomplished: {', '.join(done_goals)}")
+        
+        return "\n".join(lines) if lines else "No confident beliefs yet."
 ```
 
-### LLM Reliability Tracking
+### Dynamics Model
 
 ```python
+from dataclasses import dataclass, field
+from typing import Dict, Tuple, Optional, Set
+import hashlib
+
+@dataclass(frozen=True)
+class StateActionKey:
+    """Hashable key for state-action pairs."""
+    state_hash: str
+    action: str
+
 @dataclass
-class OracleReliability:
+class ObservedOutcome:
+    """What we observed when taking an action."""
+    next_state_hash: str
+    reward: float
+    observation_text: str  # For learning/debugging
+
+class DynamicsModel:
     """
-    Track how reliable different types of LLM responses are.
+    Learned dynamics from direct experience.
     
-    We learn this from experience.
+    In a deterministic game, one observation = certainty.
     """
     
-    # Recommendation accuracy: when LLM recommends action, does it help?
-    recommendations_followed: int = 0
-    recommendations_helped: int = 0
+    def __init__(self):
+        # (state, action) -> observed outcome
+        self.observations: Dict[StateActionKey, ObservedOutcome] = {}
+        
+        # Track which actions we've tried (regardless of state)
+        self.tried_actions: Set[str] = set()
+        
+        # Track total observations for stats
+        self.total_observations: int = 0
     
-    # Goal inference accuracy: does pursuing inferred goals lead to score?
-    goals_pursued: int = 0
-    goals_achieved: int = 0
+    def has_observation(self, state_hash: str, action: str) -> bool:
+        """Have we tried this action in this state?"""
+        key = StateActionKey(state_hash, action)
+        return key in self.observations
     
-    # Blocker analysis accuracy: when LLM says X blocks, does fixing X help?
-    blockers_identified: int = 0
-    blockers_resolved: int = 0
+    def get_observation(self, state_hash: str, action: str) -> Optional[ObservedOutcome]:
+        """Get observed outcome if we have one."""
+        key = StateActionKey(state_hash, action)
+        return self.observations.get(key)
     
-    # State suggestion utility: do suggested variables reduce contradictions?
-    variables_suggested: int = 0
-    variables_useful: int = 0
+    def record_observation(
+        self, 
+        state_hash: str, 
+        action: str, 
+        next_state_hash: str,
+        reward: float,
+        observation_text: str = "",
+    ):
+        """Record an observed outcome."""
+        key = StateActionKey(state_hash, action)
+        self.observations[key] = ObservedOutcome(
+            next_state_hash=next_state_hash,
+            reward=reward,
+            observation_text=observation_text,
+        )
+        self.tried_actions.add(action)
+        self.total_observations += 1
     
-    @property
-    def recommendation_accuracy(self) -> float:
-        if self.recommendations_followed == 0:
-            return 0.5  # Prior
-        return self.recommendations_helped / self.recommendations_followed
+    def known_reward(self, state_hash: str, action: str) -> Optional[float]:
+        """
+        Get known reward for state-action pair.
+        
+        Returns None if we haven't observed this pair.
+        """
+        obs = self.get_observation(state_hash, action)
+        return obs.reward if obs else None
     
-    @property
-    def goal_accuracy(self) -> float:
-        if self.goals_pursued == 0:
-            return 0.5
-        return self.goals_achieved / self.goals_pursued
-    
-    @property
-    def blocker_accuracy(self) -> float:
-        if self.blockers_identified == 0:
-            return 0.5
-        return self.blockers_resolved / self.blockers_identified
-    
-    def update_recommendation(self, helped: bool):
-        self.recommendations_followed += 1
-        if helped:
-            self.recommendations_helped += 1
-    
-    def get_summary(self) -> Dict:
+    def get_stats(self) -> dict:
         return {
-            "recommendation_accuracy": self.recommendation_accuracy,
-            "goal_accuracy": self.goal_accuracy,
-            "blocker_accuracy": self.blocker_accuracy,
-            "total_recommendations": self.recommendations_followed,
+            "total_observations": self.total_observations,
+            "unique_state_actions": len(self.observations),
+            "unique_actions_tried": len(self.tried_actions),
         }
 ```
 
 ---
 
-## LLM Oracle Interface
+## The Agent
 
-### Setup (Ollama/Llama3.1)
+### Value of Information
 
-```python
-import requests
-import json
-import hashlib
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass
+For a question $Q$ about action $a'$:
 
-@dataclass
-class OllamaConfig:
-    model: str = "llama3.1:8b"
-    base_url: str = "http://localhost:11434"
-    temperature: float = 0.2
-    timeout: int = 60
+1. **Predict LLM response distribution:**
+   $$P(\text{yes}) = \text{TPR} \cdot b + \text{FPR} \cdot (1-b)$$
+   where $b = P(\text{true} | B)$ is current belief
 
-class OllamaClient:
-    """Client for local Ollama instance."""
-    
-    def __init__(self, config: OllamaConfig = None):
-        self.config = config or OllamaConfig()
-        self.cache: Dict[str, str] = {}
-    
-    def complete(self, prompt: str, use_cache: bool = True) -> str:
-        cache_key = hashlib.md5(prompt.encode()).hexdigest()
-        if use_cache and cache_key in self.cache:
-            return self.cache[cache_key]
-        
-        response = requests.post(
-            f"{self.config.base_url}/api/generate",
-            json={
-                "model": self.config.model,
-                "prompt": prompt,
-                "temperature": self.config.temperature,
-                "stream": False,
-            },
-            timeout=self.config.timeout,
-        )
-        response.raise_for_status()
-        result = response.json()["response"]
-        
-        if use_cache:
-            self.cache[cache_key] = result
-        return result
-    
-    def complete_json(self, prompt: str) -> Optional[Dict]:
-        full_prompt = prompt + "\n\nRespond with valid JSON only. No other text."
-        response = self.complete(full_prompt, use_cache=False)
-        
-        try:
-            start = response.find('{')
-            end = response.rfind('}') + 1
-            if start >= 0 and end > start:
-                return json.loads(response[start:end])
-        except json.JSONDecodeError:
-            pass
-        return None
-```
+2. **Compute posterior beliefs for each answer:**
+   $$B_{\text{yes}} = \text{BayesUpdate}(B, \text{yes})$$
+   $$B_{\text{no}} = \text{BayesUpdate}(B, \text{no})$$
 
-### The Oracle
+3. **Compute best action under each posterior:**
+   $$a^*_{\text{yes}} = \arg\max_a \mathbb{E}[U(a) | B_{\text{yes}}]$$
+   $$a^*_{\text{no}} = \arg\max_a \mathbb{E}[U(a) | B_{\text{no}}]$$
+
+4. **Value of information:**
+   $$\text{VOI}(Q) = P(\text{yes}) \cdot \mathbb{E}[U(a^*_{\text{yes}}) | B_{\text{yes}}] + P(\text{no}) \cdot \mathbb{E}[U(a^*_{\text{no}}) | B_{\text{no}}] - \mathbb{E}[U(a^*) | B]$$
+
+This is the expected improvement in action value from asking. It's positive only when the answer might change which action is chosen.
 
 ```python
-class LLMOracle:
+class UnifiedDecisionMaker:
     """
-    Oracle for querying the LLM about anything.
+    Unified decision-making over game actions and LLM queries.
     
-    All responses are observations to condition on, not commands.
-    """
-    
-    def __init__(self, client: OllamaClient):
-        self.client = client
-    
-    def analyse_situation(
-        self,
-        observation: str,
-        beliefs: AgentBeliefs,
-        valid_actions: List[str],
-    ) -> SituationUnderstanding:
-        """
-        Ask LLM for comprehensive situation analysis.
-        
-        Include everything we know. Get back structured understanding.
-        """
-        prompt = f"""You are helping an AI agent play a text adventure game.
-
-=== CURRENT OBSERVATION ===
-{observation}
-
-=== AGENT'S CURRENT BELIEFS ===
-{beliefs.to_prompt_context()}
-
-=== AVAILABLE ACTIONS ===
-{json.dumps(valid_actions[:30], indent=2)}
-
-=== YOUR TASK ===
-Analyse the situation and provide guidance. Think carefully about:
-1. What is the overall goal of this game?
-2. What is the immediate next goal?
-3. What has already been accomplished?
-4. What is currently blocking progress (if anything)?
-5. What single action should be taken RIGHT NOW and why?
-6. What alternative actions might also help?
-7. What state variables are important to track?
-
-Respond with JSON in this exact format:
-{{
-    "overall_goal": "string - the main objective of the game",
-    "immediate_goal": "string - what to focus on right now",
-    "accomplished": ["list", "of", "things", "done"],
-    "progress_made": true/false - has the agent made progress recently?,
-    "blocking_condition": "string or null - what's preventing progress",
-    "blocking_reason": "string or null - why this blocks progress",
-    "recommended_action": "string - exact action from available list",
-    "action_reasoning": "string - why this action helps",
-    "alternative_actions": ["other", "good", "actions"],
-    "important_state_variables": ["variables", "to", "track"],
-    "confidence": 0.0-1.0
-}}"""
-
-        result = self.client.complete_json(prompt)
-        
-        if result:
-            return SituationUnderstanding.from_json(result)
-        else:
-            return SituationUnderstanding()
-    
-    def analyse_failure(
-        self,
-        observation: str,
-        beliefs: AgentBeliefs,
-        failed_action: str,
-        failure_response: str,
-    ) -> Dict:
-        """
-        Ask LLM why an action failed.
-        """
-        prompt = f"""You are helping an AI agent play a text adventure game.
-
-The agent tried an action that didn't work as expected.
-
-=== SITUATION BEFORE ===
-{observation}
-
-=== AGENT'S BELIEFS ===
-{beliefs.to_prompt_context()}
-
-=== ACTION TRIED ===
-{failed_action}
-
-=== GAME'S RESPONSE ===
-{failure_response}
-
-=== YOUR TASK ===
-Explain why this action failed and what needs to happen first.
-
-Respond with JSON:
-{{
-    "failure_reason": "string - why the action failed",
-    "prerequisite": "string or null - what needs to happen first",
-    "suggested_action": "string - what to do instead",
-    "lesson": "string - what the agent should learn from this"
-}}"""
-
-        return self.client.complete_json(prompt) or {}
-    
-    def detect_progress(
-        self,
-        before_observation: str,
-        action: str,
-        after_observation: str,
-        score_change: float,
-    ) -> Dict:
-        """
-        Ask LLM whether an action made progress.
-        
-        Progress can be score increase OR story advancement.
-        """
-        prompt = f"""You are helping an AI agent play a text adventure game.
-
-=== BEFORE ACTION ===
-{before_observation[:500]}
-
-=== ACTION TAKEN ===
-{action}
-
-=== AFTER ACTION ===
-{after_observation[:500]}
-
-=== SCORE CHANGE ===
-{score_change}
-
-=== YOUR TASK ===
-Did this action make meaningful progress toward winning the game?
-
-Consider:
-- Did the player reach a new location?
-- Did something important change in the game world?
-- Is the player closer to their goal?
-- Or was this just shuffling items / repeating actions?
-
-Respond with JSON:
-{{
-    "made_progress": true/false,
-    "progress_type": "string - location/item/story/none",
-    "explanation": "string - what changed",
-    "accomplishment": "string or null - what was accomplished (for tracking)"
-}}"""
-
-        return self.client.complete_json(prompt) or {"made_progress": False}
-    
-    def suggest_state_variables(
-        self,
-        observation: str,
-        beliefs: AgentBeliefs,
-        contradictions: List[str],
-    ) -> List[str]:
-        """
-        Ask LLM what state variables would help.
-        """
-        prompt = f"""You are helping an AI agent play a text adventure game.
-
-The agent is having trouble predicting outcomes. The same action sometimes works and sometimes doesn't.
-
-=== CURRENT OBSERVATION ===
-{observation}
-
-=== AGENT'S TRACKED STATE ===
-{beliefs.to_prompt_context()}
-
-=== CONTRADICTIONS OBSERVED ===
-{json.dumps(contradictions[:5])}
-
-=== YOUR TASK ===
-What state variables should the agent track to better predict outcomes?
-
-Think about:
-- What hidden conditions affect whether actions work?
-- What changes in the game world matter?
-- What prerequisites exist for important actions?
-
-Respond with JSON:
-{{
-    "suggested_variables": ["list", "of", "variable", "names"],
-    "reasoning": "string - why these matter"
-}}"""
-
-        result = self.client.complete_json(prompt)
-        if result and "suggested_variables" in result:
-            return result["suggested_variables"]
-        return []
-    
-    def extract_state(
-        self,
-        observation: str,
-        variables_to_extract: List[str],
-    ) -> Dict[str, Any]:
-        """
-        Ask LLM to extract specific state variables from observation.
-        """
-        prompt = f"""You are helping an AI agent play a text adventure game.
-
-=== CURRENT OBSERVATION ===
-{observation}
-
-=== VARIABLES TO EXTRACT ===
-{json.dumps(variables_to_extract)}
-
-=== YOUR TASK ===
-Extract the value of each variable from the observation.
-Use true/false for boolean states, strings for locations/items, null if unknown.
-
-Respond with JSON mapping variable names to values."""
-
-        return self.client.complete_json(prompt) or {}
-```
-
----
-
-## Bayesian Integration
-
-The LLM gives us observations. We update beliefs based on them, weighted by reliability.
-
-```python
-class BeliefUpdater:
-    """
-    Updates agent beliefs based on LLM observations.
-    
-    Weights updates by learned reliability.
+    Both action types evaluated by expected utility.
     """
     
-    def __init__(self, reliability: OracleReliability):
-        self.reliability = reliability
+    def __init__(self, question_cost: float = 0.01):
+        """
+        Args:
+            question_cost: Cost c of asking one question (in reward units).
+                          Represents value of computation time.
+        """
+        self.question_cost = question_cost
     
-    def update_from_understanding(
+    def choose(
         self,
-        beliefs: AgentBeliefs,
-        understanding: SituationUnderstanding,
-    ) -> AgentBeliefs:
-        """
-        Update beliefs based on LLM's situation analysis.
-        
-        More reliable sources get more weight.
-        """
-        # Goal updates - always incorporate (hard to verify, but useful)
-        if understanding.overall_goal and beliefs.overall_goal == "unknown":
-            beliefs.overall_goal = understanding.overall_goal
-        
-        if understanding.immediate_goal:
-            beliefs.current_subgoal = understanding.immediate_goal
-        
-        # Progress updates - incorporate if confidence is high
-        if understanding.confidence > 0.6:
-            for item in understanding.accomplished:
-                if item not in beliefs.accomplished:
-                    beliefs.accomplished.append(item)
-        
-        # Blocker updates - very useful for planning
-        if understanding.blocking_condition:
-            beliefs.blocking_condition = understanding.blocking_condition
-        
-        return beliefs
-    
-    def update_from_failure_analysis(
-        self,
-        beliefs: AgentBeliefs,
-        action: str,
-        analysis: Dict,
-    ) -> AgentBeliefs:
-        """
-        Update beliefs based on failure analysis.
-        """
-        if "failure_reason" in analysis:
-            beliefs.failed_actions[action] = analysis["failure_reason"]
-        
-        if "prerequisite" in analysis and analysis["prerequisite"]:
-            beliefs.blocking_condition = analysis["prerequisite"]
-        
-        return beliefs
-    
-    def update_from_progress(
-        self,
-        beliefs: AgentBeliefs,
-        progress: Dict,
-    ) -> AgentBeliefs:
-        """
-        Update beliefs based on progress detection.
-        """
-        if progress.get("made_progress") and progress.get("accomplishment"):
-            accomplishment = progress["accomplishment"]
-            if accomplishment not in beliefs.accomplished:
-                beliefs.accomplished.append(accomplishment)
-        
-        # Clear blocker if we made progress
-        if progress.get("made_progress"):
-            beliefs.blocking_condition = None
-        
-        return beliefs
-```
-
----
-
-## Action Selection
-
-Uses LLM understanding to guide action selection.
-
-```python
-import random
-from typing import List, Optional, Tuple
-
-class InformedActionSelector:
-    """
-    Selects actions using LLM understanding + learned dynamics.
-    """
-    
-    def __init__(
-        self,
-        oracle: LLMOracle,
-        reliability: OracleReliability,
+        game_actions: List[str],
+        possible_questions: List[Tuple[str, str]],  # (action, question)
+        beliefs: Dict[str, float],
+        sensor: BinarySensor,
         dynamics: 'DynamicsModel',
-        exploration_rate: float = 0.2,
-    ):
-        self.oracle = oracle
-        self.reliability = reliability
-        self.dynamics = dynamics
-        self.exploration_rate = exploration_rate
-        
-        # Cache current understanding
-        self.current_understanding: Optional[SituationUnderstanding] = None
-    
-    def select_action(
-        self,
-        observation: str,
-        beliefs: AgentBeliefs,
-        valid_actions: List[str],
+        state_hash: str,
     ) -> Tuple[str, str]:
         """
-        Select action based on LLM understanding and learned dynamics.
+        Choose between asking a question or taking a game action.
         
-        Returns: (action, reason)
+        Returns: (type, value) where type is 'ask' or 'take'
         """
-        if not valid_actions:
-            return "look", "no valid actions available"
+        # Compute EU for all game actions
+        game_eus = {}
+        for action in game_actions:
+            known = dynamics.known_reward(state_hash, action)
+            if known is not None:
+                game_eus[action] = known
+            else:
+                belief = beliefs.get(action, 0.5)
+                game_eus[action] = belief * 1.0  # EU = P(helps) * reward_if_helps
         
-        # Get LLM's situation analysis
-        understanding = self.oracle.analyse_situation(
-            observation, beliefs, valid_actions
-        )
-        self.current_understanding = understanding
+        best_game_action = max(game_actions, key=lambda a: game_eus[a])
+        best_game_eu = game_eus[best_game_action]
         
-        # Decision: follow recommendation, explore, or use dynamics?
+        # Compute EU for all questions (VOI - cost)
+        best_question = None
+        best_question_eu = float('-inf')
         
-        # 1. If LLM has high-confidence recommendation, probably follow it
-        if (understanding.recommended_action and 
-            understanding.confidence > 0.6 and
-            self.reliability.recommendation_accuracy > 0.4):
+        for action, question in possible_questions:
+            # Skip if we already know outcome (no uncertainty to resolve)
+            if dynamics.has_observation(state_hash, action):
+                continue
             
-            # Find matching action in valid actions
-            rec = understanding.recommended_action.lower()
-            for action in valid_actions:
-                if action.lower() == rec or rec in action.lower() or action.lower() in rec:
-                    # Follow recommendation with probability based on reliability
-                    if random.random() < 0.7 + 0.3 * self.reliability.recommendation_accuracy:
-                        return action, f"LLM recommended: {understanding.action_reasoning}"
+            belief = beliefs.get(action, 0.5)
+            voi = self.compute_voi(action, belief, sensor, game_eus)
+            question_eu = voi - self.question_cost
+            
+            if question_eu > best_question_eu:
+                best_question_eu = question_eu
+                best_question = (action, question)
         
-        # 2. If we have a blocker, try to address it
-        if understanding.blocking_condition:
-            for action in valid_actions:
-                if self._action_addresses_blocker(action, understanding.blocking_condition):
-                    return action, f"addressing blocker: {understanding.blocking_condition}"
-        
-        # 3. Use dynamics model for actions we have experience with
-        experienced_actions = [
-            a for a in valid_actions 
-            if self.dynamics.observation_count(beliefs, a) > 0
-        ]
-        
-        if experienced_actions and random.random() > self.exploration_rate:
-            best_action = max(
-                experienced_actions,
-                key=lambda a: self.dynamics.expected_reward(beliefs, a)
-            )
-            return best_action, "best learned action"
-        
-        # 4. Explore: prefer LLM's alternative suggestions
-        if understanding.alternative_actions:
-            for alt in understanding.alternative_actions:
-                for action in valid_actions:
-                    if alt.lower() in action.lower():
-                        return action, f"exploring LLM alternative"
-        
-        # 5. Random exploration weighted toward actions LLM hasn't flagged as useless
-        return random.choice(valid_actions), "random exploration"
+        # Unified decision: take whichever has higher EU
+        if best_question is not None and best_question_eu > best_game_eu:
+            return ('ask', best_question)
+        else:
+            return ('take', best_game_action)
     
-    def _action_addresses_blocker(self, action: str, blocker: str) -> bool:
-        """Heuristic: does this action seem to address the blocker?"""
-        action_lower = action.lower()
-        blocker_lower = blocker.lower()
+    def compute_voi(
+        self,
+        action: str,
+        current_belief: float,
+        sensor: BinarySensor,
+        all_game_eus: Dict[str, float],
+    ) -> float:
+        """
+        Compute value of information for asking about this action.
         
-        # Simple keyword matching
-        keywords = blocker_lower.split()
-        for word in keywords:
-            if len(word) > 3 and word in action_lower:
-                return True
+        VOI = E[max EU after asking] - max EU now
+        """
+        current_best_eu = max(all_game_eus.values())
         
-        # Common patterns
-        if "stand" in blocker_lower and "stand" in action_lower:
-            return True
-        if "dress" in blocker_lower and ("wear" in action_lower or "dress" in action_lower):
-            return True
-        if "door" in blocker_lower and ("open" in action_lower or "unlock" in action_lower):
-            return True
+        # P(LLM says yes)
+        p_yes = sensor.tpr * current_belief + sensor.fpr * (1 - current_belief)
+        p_no = 1 - p_yes
         
-        return False
+        # Posterior beliefs after each answer
+        posterior_if_yes = sensor.posterior(current_belief, said_yes=True)
+        posterior_if_no = sensor.posterior(current_belief, said_yes=False)
+        
+        # EU of this action under each posterior
+        eu_if_yes = posterior_if_yes * 1.0
+        eu_if_no = posterior_if_no * 1.0
+        
+        # Best EU achievable after each answer
+        other_best = max(
+            (eu for a, eu in all_game_eus.items() if a != action),
+            default=0.0
+        )
+        
+        best_eu_if_yes = max(eu_if_yes, other_best)
+        best_eu_if_no = max(eu_if_no, other_best)
+        
+        # Expected best EU after asking
+        expected_best_after = p_yes * best_eu_if_yes + p_no * best_eu_if_no
+        
+        # VOI = improvement over current best
+        voi = expected_best_after - current_best_eu
+        
+        return max(0.0, voi)
 ```
 
----
-
-## Main Agent
+### The Agent
 
 ```python
 from jericho import FrotzEnv
-from typing import List, Dict, Optional
-import time
+from typing import List, Dict, Tuple, Optional
+import hashlib
 
 class BayesianIFAgent:
     """
-    Bayesian IF agent with rich LLM oracle integration.
+    Bayesian IF agent with LLM as queryable sensor bank.
     
-    The LLM helps understand. The agent decides.
+    Unified decision-making: asking questions and taking game actions
+    are both evaluated by expected utility in the same framework.
+    
+    Core loop:
+    1. Generate possible questions and game actions
+    2. Compute EU for each (VOI - cost for questions, E[R] for game actions)
+    3. Choose argmax
+    4. If question: ask, update beliefs, repeat from 1
+    5. If game action: take it, observe outcome, learn
     """
     
     def __init__(
-        self,
-        ollama_config: OllamaConfig = None,
-        exploration_rate: float = 0.2,
+        self, 
+        llm_client,
+        question_cost: float = 0.01,
     ):
-        # LLM setup
-        self.client = OllamaClient(ollama_config or OllamaConfig())
-        self.oracle = LLMOracle(self.client)
-        
-        # Belief state
-        self.beliefs = AgentBeliefs()
-        
-        # Reliability tracking
-        self.reliability = OracleReliability()
-        
-        # Dynamics model
+        """
+        Args:
+            llm_client: Client for LLM queries
+            question_cost: Cost of asking one question (in reward units).
+                          Represents value of computation time.
+        """
+        self.sensor_bank = LLMSensorBank(llm_client)
         self.dynamics = DynamicsModel()
+        self.beliefs = BeliefState()
         
-        # Action selector
-        self.action_selector = InformedActionSelector(
-            oracle=self.oracle,
-            reliability=self.reliability,
-            dynamics=self.dynamics,
-            exploration_rate=exploration_rate,
-        )
+        self.decision_maker = UnifiedDecisionMaker(question_cost=question_cost)
         
-        # Belief updater
-        self.belief_updater = BeliefUpdater(self.reliability)
+        # Tracking
+        self.current_state_hash: Optional[str] = None
+        self.last_action: Optional[str] = None
+        self.last_llm_predictions: Dict[str, bool] = {}
         
-        # Episode tracking
-        self.episode_count = 0
-        self.previous_observation = ""
-        self.previous_action = ""
-        self.previous_score = 0
+        # Stats
+        self.total_questions_asked: int = 0
+        self.episode_count: int = 0
     
-    def reset_episode(self):
-        """Reset for new episode, keeping learned knowledge."""
-        self.beliefs = AgentBeliefs(
-            overall_goal=self.beliefs.overall_goal,  # Keep learned goal
-        )
-        self.previous_observation = ""
-        self.previous_action = ""
-        self.previous_score = 0
+    def get_state_hash(self, env: FrotzEnv) -> str:
+        """Get hash of current game state."""
+        return str(env.get_world_state_hash())
     
-    def choose_action(self, env: FrotzEnv, observation: str) -> str:
+    def choose_action(
+        self, 
+        env: FrotzEnv, 
+        observation: str,
+    ) -> Tuple[str, str]:
         """
-        Choose action using LLM understanding + Bayesian reasoning.
-        """
-        # Update beliefs from game state
-        self._update_beliefs_from_env(env, observation)
+        Choose action via unified expected utility maximisation.
         
-        # Get valid actions
+        Returns: (action, explanation)
+        """
+        self.sensor_bank.clear_cache()
+        
+        state_hash = self.get_state_hash(env)
+        self.current_state_hash = state_hash
         valid_actions = env.get_valid_actions() or ["look"]
         
-        # Select action
-        action, reason = self.action_selector.select_action(
-            observation, self.beliefs, valid_actions
-        )
+        context = f"Observation: {observation[:500]}\n\n{self.beliefs.to_context_string()}"
         
-        # Record for learning
-        self.previous_observation = observation
-        self.previous_action = action
-        self.previous_score = env.get_score()
+        # Build current belief dict for actions
+        action_beliefs = {
+            a: self.beliefs.get_belief(a, "action", default=0.5)
+            for a in valid_actions
+        }
         
-        # Update action history
-        self.beliefs.action_history.append(action)
-        if len(self.beliefs.action_history) > 50:
-            self.beliefs.action_history = self.beliefs.action_history[-50:]
+        sensor = self.sensor_bank.sensors[QuestionType.ACTION_HELPS]
         
-        return action
+        # Unified decision loop: ask or act?
+        while True:
+            # Generate possible questions
+            possible_questions = [
+                (a, f"Will the action '{a}' make meaningful progress toward winning the game?")
+                for a in valid_actions
+                if not self.dynamics.has_observation(state_hash, a)
+            ]
+            
+            # Unified decision
+            decision_type, decision_value = self.decision_maker.choose(
+                game_actions=valid_actions,
+                possible_questions=possible_questions,
+                beliefs=action_beliefs,
+                sensor=sensor,
+                dynamics=self.dynamics,
+                state_hash=state_hash,
+            )
+            
+            if decision_type == 'take':
+                # Best choice is a game action
+                game_action = decision_value
+                eu = action_beliefs.get(game_action, 0.5)
+                known = self.dynamics.known_reward(state_hash, game_action)
+                if known is not None:
+                    explanation = f"EU={known:.3f} (known)"
+                else:
+                    explanation = f"EU={eu:.3f} (belief={action_beliefs.get(game_action, 0.5):.2f})"
+                
+                self.last_action = game_action
+                return game_action, explanation
+            
+            else:
+                # Best choice is to ask a question
+                action_to_ask, question = decision_value
+                
+                answer, _ = self.sensor_bank.ask(
+                    QuestionType.ACTION_HELPS, question, context
+                )
+                
+                # Update beliefs via Bayes
+                prior = action_beliefs[action_to_ask]
+                posterior = sensor.posterior(prior, answer)
+                action_beliefs[action_to_ask] = posterior
+                self.beliefs.update_belief(action_to_ask, "action", posterior)
+                
+                # Track for ground truth learning
+                self.last_llm_predictions[action_to_ask] = answer
+                
+                self.total_questions_asked += 1
+                
+                # Loop continues: re-evaluate whether to ask more or act
     
-    def observe_outcome(self, env: FrotzEnv, observation: str, reward: float):
+    def observe_outcome(
+        self,
+        env: FrotzEnv,
+        action: str,
+        observation: str,
+        reward: float,
+    ):
         """
         Learn from outcome.
+        
+        - Record in dynamics model
+        - Update sensor reliability from ground truth
         """
-        current_score = env.get_score()
-        score_change = current_score - self.previous_score
+        next_state_hash = self.get_state_hash(env)
         
-        # Detect progress using LLM
-        progress = self.oracle.detect_progress(
-            self.previous_observation,
-            self.previous_action,
-            observation,
-            score_change,
-        )
-        
-        # Update beliefs from progress
-        self.beliefs = self.belief_updater.update_from_progress(
-            self.beliefs, progress
-        )
-        
-        # Update reliability tracking
-        understanding = self.action_selector.current_understanding
-        if understanding and understanding.recommended_action:
-            was_recommended = (
-                self.previous_action.lower() in understanding.recommended_action.lower() or
-                understanding.recommended_action.lower() in self.previous_action.lower()
-            )
-            if was_recommended:
-                self.reliability.update_recommendation(
-                    helped=progress.get("made_progress", False) or score_change > 0
-                )
-        
-        # Analyse failure if action didn't seem to work
-        if not progress.get("made_progress") and score_change <= 0:
-            failure_analysis = self.oracle.analyse_failure(
-                self.previous_observation,
-                self.beliefs,
-                self.previous_action,
-                observation,
-            )
-            self.beliefs = self.belief_updater.update_from_failure_analysis(
-                self.beliefs, self.previous_action, failure_analysis
+        # Record dynamics
+        if self.current_state_hash:
+            self.dynamics.record_observation(
+                state_hash=self.current_state_hash,
+                action=action,
+                next_state_hash=next_state_hash,
+                reward=reward,
+                observation_text=observation[:200],
             )
         
-        # Update observation history
-        self.beliefs.observation_history.append(observation[:200])
-        if len(self.beliefs.observation_history) > 20:
-            self.beliefs.observation_history = self.beliefs.observation_history[-20:]
-    
-    def _update_beliefs_from_env(self, env: FrotzEnv, observation: str):
-        """Update beliefs from Jericho ground truth."""
-        # Location
-        location = env.get_player_location()
-        if location:
-            self.beliefs.location = location.name if hasattr(location, 'name') else str(location.num)
+        # Learn sensor reliability from ground truth
+        # Did the action "help"? Define as: reward > 0 OR state changed
+        helped = reward > 0 or next_state_hash != self.current_state_hash
         
-        # Inventory
-        inventory = env.get_inventory()
-        if inventory:
-            self.beliefs.inventory = [obj.name for obj in inventory]
-        
-        # Extract any tracked state variables
-        if self.beliefs.tracked_state:
-            extracted = self.oracle.extract_state(
-                observation,
-                list(self.beliefs.tracked_state.keys()),
+        # Update sensor for any predictions we made about this action
+        if action in self.last_llm_predictions:
+            llm_said_helps = self.last_llm_predictions[action]
+            self.sensor_bank.update_from_ground_truth(
+                QuestionType.ACTION_HELPS,
+                said_yes=llm_said_helps,
+                actual_truth=helped,
             )
-            self.beliefs.tracked_state.update(extracted)
+        
+        # Clear predictions for next turn
+        self.last_llm_predictions = {}
+        
+        # Update beliefs based on outcome
+        # If we got reward, mark as success
+        if reward > 0:
+            self.beliefs.set_certain(action, "action", True)
     
     def play_episode(
         self,
@@ -897,43 +875,41 @@ class BayesianIFAgent:
         verbose: bool = False,
     ) -> Dict:
         """Play one episode."""
-        self.reset_episode()
         obs, info = env.reset()
         total_reward = 0
         steps = 0
+        
+        # Reset per-episode state (but keep learned dynamics and sensor reliability)
+        self.beliefs = BeliefState()
+        self.last_llm_predictions = {}
         
         if verbose:
             print(f"\n{'='*60}")
             print(f"Episode {self.episode_count + 1}")
             print(f"{'='*60}")
-            print(obs[:500])
+            print(obs[:400])
         
         while not env.game_over() and steps < max_steps:
             # Choose action
-            action = self.choose_action(env, obs)
+            action, explanation = self.choose_action(env, obs)
             
             if verbose:
-                understanding = self.action_selector.current_understanding
                 print(f"\n> {action}")
-                if understanding and understanding.action_reasoning:
-                    print(f"  Reasoning: {understanding.action_reasoning}")
-                if understanding and understanding.blocking_condition:
-                    print(f"  Blocker: {understanding.blocking_condition}")
+                print(f"  {explanation}")
             
             # Take action
             old_score = env.get_score()
             obs, reward, done, info = env.step(action)
             new_score = env.get_score()
-            total_reward += reward
             steps += 1
             
-            if verbose:
-                if new_score > old_score:
-                    print(f"  *** SCORE: {old_score} → {new_score} ***")
-                print(obs[:300])
+            if verbose and new_score > old_score:
+                print(f"  *** SCORE: {old_score} → {new_score} ***")
             
-            # Learn from outcome
-            self.observe_outcome(env, obs, reward)
+            # Observe outcome
+            self.observe_outcome(env, action, obs, reward)
+            
+            total_reward += reward
         
         self.episode_count += 1
         
@@ -942,8 +918,9 @@ class BayesianIFAgent:
             "total_reward": total_reward,
             "final_score": env.get_score(),
             "steps": steps,
-            "accomplished": self.beliefs.accomplished,
-            "reliability": self.reliability.get_summary(),
+            "questions_asked": self.total_questions_asked,
+            "dynamics_stats": self.dynamics.get_stats(),
+            "sensor_stats": self.sensor_bank.get_all_stats(),
         }
     
     def play_multiple_episodes(
@@ -959,91 +936,116 @@ class BayesianIFAgent:
         
         for i in range(n_episodes):
             result = self.play_episode(
-                env, max_steps, 
-                verbose=(verbose and i < 2)  # Verbose for first 2 episodes
+                env, max_steps,
+                verbose=(verbose and i < 2)
             )
             results.append(result)
             
+            # Print summary
+            sensor_stats = self.sensor_bank.sensors[QuestionType.ACTION_HELPS].get_stats()
             print(f"Episode {i+1}: score={result['final_score']}, "
                   f"steps={result['steps']}, "
-                  f"accomplished={len(result['accomplished'])} things")
+                  f"sensor_reliability={sensor_stats['reliability']:.2f}")
         
-        # Summary
+        # Final summary
         scores = [r['final_score'] for r in results]
         print(f"\n{'='*60}")
         print(f"SUMMARY")
         print(f"{'='*60}")
-        print(f"Mean score: {sum(scores)/len(scores):.2f}")
-        print(f"Max score: {max(scores)}")
-        print(f"LLM recommendation accuracy: {self.reliability.recommendation_accuracy:.2f}")
-        print(f"Overall goal learned: {self.beliefs.overall_goal}")
+        print(f"Scores: {scores}")
+        print(f"Mean: {sum(scores)/len(scores):.2f}, Max: {max(scores)}")
+        print(f"Total questions asked: {self.total_questions_asked}")
+        print(f"Dynamics: {self.dynamics.get_stats()}")
+        
+        for qt, sensor in self.sensor_bank.sensors.items():
+            stats = sensor.get_stats()
+            if stats['ground_truths'] > 0:
+                print(f"Sensor {qt.value}: TPR={stats['tpr']:.2f}, FPR={stats['fpr']:.2f}, n={stats['ground_truths']}")
         
         return results
 ```
 
 ---
 
-## Runner Script
+## Ollama Client
+
+```python
+import requests
+import json
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class OllamaConfig:
+    model: str = "llama3.1:8b"
+    base_url: str = "http://localhost:11434"
+    temperature: float = 0.1
+    timeout: int = 30
+
+class OllamaClient:
+    """Client for local Ollama instance."""
+    
+    def __init__(self, config: OllamaConfig = None):
+        self.config = config or OllamaConfig()
+    
+    def complete(self, prompt: str) -> str:
+        response = requests.post(
+            f"{self.config.base_url}/api/generate",
+            json={
+                "model": self.config.model,
+                "prompt": prompt,
+                "temperature": self.config.temperature,
+                "stream": False,
+            },
+            timeout=self.config.timeout,
+        )
+        response.raise_for_status()
+        return response.json()["response"]
+```
+
+---
+
+## Runner
 
 ```python
 #!/usr/bin/env python3
 """
-Run the Bayesian IF agent with rich LLM integration.
+Run the Bayesian IF agent.
 
 Usage:
     python runner.py [game_path] [--episodes N] [--verbose]
 
 Prerequisites:
-    1. Install Ollama: curl -fsSL https://ollama.com/install.sh | sh
-    2. Pull model: ollama pull llama3.1:8b
-    3. Start Ollama: ollama serve
+    1. ollama serve
+    2. ollama pull llama3.1:8b
 """
 
 import argparse
-import requests
 import sys
 
-def check_ollama():
-    """Verify Ollama is running."""
-    try:
-        response = requests.get("http://localhost:11434/api/tags", timeout=5)
-        return response.status_code == 200
-    except:
-        return False
-
 def main():
-    parser = argparse.ArgumentParser(description="Bayesian IF Agent")
-    parser.add_argument("game", nargs="?", default="games/905.z5",
-                        help="Path to game file")
-    parser.add_argument("--episodes", type=int, default=10,
-                        help="Number of episodes to play")
-    parser.add_argument("--max-steps", type=int, default=100,
-                        help="Maximum steps per episode")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Print detailed output")
-    parser.add_argument("--model", default="llama3.1:8b",
-                        help="Ollama model to use")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("game", nargs="?", default="games/905.z5")
+    parser.add_argument("--episodes", type=int, default=10)
+    parser.add_argument("--max-steps", type=int, default=100)
+    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--model", default="llama3.1:8b")
     args = parser.parse_args()
     
     # Check Ollama
-    if not check_ollama():
-        print("ERROR: Ollama is not running.")
-        print("Start it with: ollama serve")
-        print("Then pull the model: ollama pull llama3.1:8b")
+    import requests
+    try:
+        requests.get("http://localhost:11434/api/tags", timeout=5)
+    except:
+        print("ERROR: Ollama not running. Start with: ollama serve")
         sys.exit(1)
     
-    # Import here to avoid issues if dependencies missing
-    from agent import BayesianIFAgent, OllamaConfig
+    from agent import BayesianIFAgent, OllamaClient, OllamaConfig
     
-    # Create agent
     config = OllamaConfig(model=args.model)
-    agent = BayesianIFAgent(ollama_config=config)
+    client = OllamaClient(config)
+    agent = BayesianIFAgent(client)
     
-    print(f"Playing {args.game} for {args.episodes} episodes...")
-    print(f"Using model: {args.model}")
-    print()
-    
-    # Play
     results = agent.play_multiple_episodes(
         game_path=args.game,
         n_episodes=args.episodes,
@@ -1051,11 +1053,9 @@ def main():
         verbose=args.verbose,
     )
     
-    # Save results
     import json
     with open("results.json", "w") as f:
         json.dump(results, f, indent=2, default=str)
-    print(f"\nResults saved to results.json")
 
 if __name__ == "__main__":
     main()
@@ -1063,102 +1063,69 @@ if __name__ == "__main__":
 
 ---
 
-## Testing
+## Why This Fixes Loops
 
-### Test 1: Oracle provides useful understanding
+No loop detection needed. Here's why:
 
-```python
-def test_oracle_understanding():
-    client = OllamaClient()
-    oracle = LLMOracle(client)
-    beliefs = AgentBeliefs()
-    
-    observation = """
-    The phone is ringing loudly. You are lying in bed, still groggy.
-    The alarm clock shows 9:05 AM. You're going to be late for work!
-    """
-    
-    valid_actions = [
-        "answer phone", "sleep", "stand up", "take blanket",
-        "put pillow on bed", "look", "inventory"
-    ]
-    
-    understanding = oracle.analyse_situation(observation, beliefs, valid_actions)
-    
-    print(f"Overall goal: {understanding.overall_goal}")
-    print(f"Immediate goal: {understanding.immediate_goal}")
-    print(f"Recommended: {understanding.recommended_action}")
-    print(f"Reasoning: {understanding.action_reasoning}")
-    print(f"Blocker: {understanding.blocking_condition}")
-    
-    # Should identify "answer phone" or "stand up" as important
-    assert understanding.recommended_action is not None
-```
+1. Agent tries "look under bed" in state S
+2. Gets reward 0, state doesn't change
+3. Dynamics model records: (S, "look under bed") → reward=0
+4. Next turn, in same state S
+5. EU("look under bed") = known_reward = 0
+6. EU(any untried action) = P(helps) × 1 + P(doesn't) × 0 = P(helps) > 0 (unless P(helps) = 0)
+7. Agent picks untried action
 
-### Test 2: Failure analysis works
+The loop never forms because **repeating a known-futile action has EU=0**, while **untried actions have EU = P(helps) > 0** (assuming non-zero prior).
 
-```python
-def test_failure_analysis():
-    client = OllamaClient()
-    oracle = LLMOracle(client)
-    beliefs = AgentBeliefs(location="bedroom")
-    
-    observation = "You are lying in bed."
-    failed_action = "go east"
-    failure_response = "You'll have to get up first."
-    
-    analysis = oracle.analyse_failure(
-        observation, beliefs, failed_action, failure_response
-    )
-    
-    print(f"Failure reason: {analysis.get('failure_reason')}")
-    print(f"Prerequisite: {analysis.get('prerequisite')}")
-    print(f"Suggested: {analysis.get('suggested_action')}")
-    
-    # Should identify "stand up" as prerequisite
-    assert "stand" in analysis.get('prerequisite', '').lower() or \
-           "get up" in analysis.get('prerequisite', '').lower()
-```
+No hack. Just rational expected utility maximisation.
 
-### Test 3: Reliability learning
+---
 
-```python
-def test_reliability_learning():
-    reliability = OracleReliability()
-    
-    # Simulate: LLM recommendations help 70% of time
-    for _ in range(100):
-        helped = random.random() < 0.7
-        reliability.update_recommendation(helped)
-    
-    # Should learn approximately 70% accuracy
-    assert 0.6 < reliability.recommendation_accuracy < 0.8
-    print(f"Learned accuracy: {reliability.recommendation_accuracy:.2f}")
-```
+## Why Sensor Reliability Matters
+
+If the LLM always said "yes, every action helps" (high FPR), the agent would learn this:
+- FPR increases toward 1.0
+- Sensor reliability = TPR - FPR → 0 or negative
+- Posteriors barely update from LLM answers
+- Agent falls back to prior beliefs + dynamics
+
+If the LLM is actually helpful (high TPR, low FPR):
+- Reliability stays high
+- LLM answers meaningfully update beliefs
+- Agent focuses on promising actions
+
+The agent automatically learns how much to trust the oracle.
+
+---
+
+## Key Properties
+
+1. **Unified decision space**: Asking questions and taking game actions evaluated in same EU framework
+2. **Direct experience dominates**: Once observed, no uncertainty
+3. **All decisions are EU maximisation**: No hacks, no overrides
+4. **Questions asked rationally**: Only when VOI - cost > best game action EU
+5. **Sensor reliability is learned**: Agent discovers how much to trust LLM
+6. **No loops possible**: Known-futile actions have EU=0, untried have EU=P(helps)>0
+7. **Exploration emerges naturally**: Uncertainty gives higher EU than known-bad outcomes
+
+---
+
+## Metrics to Track
+
+- **Score per episode**: Are we improving?
+- **Sensor TPR/FPR**: Is the LLM reliable? Are we learning its reliability?
+- **Questions per turn**: How many questions before acting?
+- **Question cost sensitivity**: How does varying $c$ affect behaviour?
+- **Unique state-actions observed**: Coverage of dynamics
+- **Decision explanations**: How often "ask" vs "take"? How often "known" vs "belief"?
 
 ---
 
 ## Success Criteria
 
-1. **LLM provides coherent understanding**: Goals, blockers, recommendations make sense
-2. **Agent acts on understanding**: Follows recommendations, addresses blockers
-3. **Reliability is learned**: Accurate when LLM is helpful, sceptical when not
-4. **Progress through dependency chain**: Agent reaches bathroom, living room, car
-5. **Score improves over episodes**: Later episodes better than earlier
-6. **Principled integration**: LLM outputs are observations, agent decides
-
----
-
-## Key Differences from v2
-
-| v2 | v3 |
-|----|-----|
-| LLM rates individual actions | LLM analyses whole situation |
-| Single-shot relevance scores | Rich structured understanding |
-| No goal tracking | Explicit goal/subgoal tracking |
-| No blocker awareness | Blocker detection and addressing |
-| No failure analysis | Learn from failures |
-| Limited context to LLM | Full belief state in prompts |
-| LLM reliability for relevance only | Reliability for multiple query types |
-
-The agent now has a **theory of the situation**, not just action scores.
+1. **No loops**: Agent never repeats futile actions
+2. **Sensor learning**: TPR/FPR converge to true reliability
+3. **Rational questioning**: Asks when valuable, acts when not
+4. **Exploration**: Agent tries diverse actions, doesn't get stuck
+5. **Score improvement**: Later episodes better than earlier
+6. **Principled**: All behaviour explainable via EU maximisation

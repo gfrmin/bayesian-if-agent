@@ -1,718 +1,486 @@
 """
-Bayesian Interactive Fiction Agent — v3
+Bayesian Interactive Fiction Agent — v4
 
-An agent that maintains rich beliefs about the game situation and uses
-an LLM oracle for structured understanding.
+Binary sensor bank + unified expected utility maximisation.
 
-Key design principles:
-- Jericho provides GROUND TRUTH state (location, inventory, world hash)
-- LLM provides ORACLE analysis (goals, blockers, recommendations)
-- Agent LEARNS the oracle's reliability from experience
-- Bayesian updating combines oracle observations with dynamics posterior
-- Expected utility maximisation selects ACTIONS
+Core insight: instead of asking the LLM for rich structured analysis, ask it
+simple yes/no questions and learn each question type's reliability via
+Beta-distributed TPR/FPR.
 
-What's FIXED:
-- Bayesian inference as update rule
-- Expected utility as action selection
-- Game interface: state from Jericho, score signal
-
-What's LEARNED:
-- Dynamics: P(outcome | state, action)
-- Oracle reliability: per-query-type accuracy
-- Beliefs: goals, blockers, state variables
+All components are stdlib-only. LLM client is injected via duck typing
+(any object with a .complete(prompt) -> str method).
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Optional, Set, Any
-from collections import defaultdict
-import random
-import math
+from typing import Any, Dict, List, Tuple, Optional, Set
+from enum import Enum
 
 
 # =============================================================================
-# STATE REPRESENTATION (unchanged from v2)
-# =============================================================================
-
-@dataclass(frozen=True)
-class GameState:
-    """
-    Game state from Jericho ground truth.
-
-    location: int (Jericho location ID)
-    inventory: frozenset of item names
-    world_hash: str (Jericho state hash for full disambiguation)
-    """
-    location: int
-    inventory: frozenset
-    world_hash: str
-
-    def __str__(self):
-        return f"State(loc={self.location}, inv={len(self.inventory)} items)"
-
-    @staticmethod
-    def initial():
-        return GameState(
-            location=0,
-            inventory=frozenset(),
-            world_hash=""
-        )
-
-
-@dataclass(frozen=True)
-class Outcome:
-    """Result of taking an action."""
-    next_state: GameState
-    reward: float
-
-
-@dataclass(frozen=True)
-class Transition:
-    """A single observed transition with raw observation for history."""
-    state: GameState
-    action: str
-    next_state: GameState
-    reward: float
-    raw_observation: str
-
-
-# =============================================================================
-# AGENT BELIEFS (v3)
+# BINARY SENSOR
 # =============================================================================
 
 @dataclass
-class AgentBeliefs:
+class BinarySensor:
     """
-    Everything the agent believes about the current situation.
+    A yes/no sensor with learned reliability.
 
-    This gets passed to the LLM for context.
-    This gets updated based on LLM responses.
-    """
-
-    # Current state
-    location: str = "unknown"
-    inventory: List[str] = field(default_factory=list)
-
-    # Goal tracking
-    overall_goal: str = "unknown"
-    current_subgoal: str = "unknown"
-    accomplished: List[str] = field(default_factory=list)
-
-    # Blocker tracking
-    blocking_condition: Optional[str] = None
-    failed_actions: Dict[str, str] = field(default_factory=dict)  # action -> reason
-
-    # State variables we're tracking
-    tracked_state: Dict[str, Any] = field(default_factory=dict)
-
-    # History
-    action_history: List[str] = field(default_factory=list)
-    observation_history: List[str] = field(default_factory=list)
-
-    # Internal (for state key derivation)
-    _location_id: int = 0
-    _world_hash: str = ""
-
-    def to_prompt_context(self) -> str:
-        """Format beliefs for inclusion in LLM prompt."""
-        sections = []
-
-        sections.append(f"LOCATION: {self.location}")
-        sections.append(f"INVENTORY: {', '.join(self.inventory) if self.inventory else 'empty'}")
-        sections.append(f"OVERALL GOAL: {self.overall_goal}")
-        sections.append(f"CURRENT SUBGOAL: {self.current_subgoal}")
-
-        if self.accomplished:
-            sections.append(f"ACCOMPLISHED: {', '.join(self.accomplished)}")
-
-        if self.blocking_condition:
-            sections.append(f"BLOCKED BY: {self.blocking_condition}")
-
-        if self.failed_actions:
-            failed = [f"'{a}' ({r})" for a, r in list(self.failed_actions.items())[-5:]]
-            sections.append(f"RECENT FAILURES: {'; '.join(failed)}")
-
-        if self.tracked_state:
-            state_str = ', '.join(f"{k}={v}" for k, v in self.tracked_state.items())
-            sections.append(f"TRACKED STATE: {state_str}")
-
-        if self.action_history:
-            recent = self.action_history[-10:]
-            sections.append(f"RECENT ACTIONS: {' -> '.join(recent)}")
-
-        return '\n'.join(sections)
-
-    def to_state_key(self) -> GameState:
-        """Derive a frozen hashable key from current beliefs."""
-        return GameState(
-            location=self._location_id,
-            inventory=frozenset(self.inventory),
-            world_hash=self._world_hash,
-        )
-
-
-@dataclass
-class SituationUnderstanding:
-    """
-    LLM's analysis of the current situation.
-
-    This is an OBSERVATION — data to condition on.
+    Models P(sensor_output | truth) as Beta distributions.
     """
 
-    # Goal understanding
-    overall_goal: Optional[str] = None
-    immediate_goal: Optional[str] = None
+    # True positive: P(says Yes | actually Yes)
+    tp_alpha: float = 7.0   # Prior: ~70% TPR
+    tp_beta: float = 3.0
 
-    # Progress understanding
-    accomplished: List[str] = field(default_factory=list)
-    progress_made: bool = False
+    # False positive: P(says Yes | actually No)
+    fp_alpha: float = 3.0   # Prior: ~30% FPR
+    fp_beta: float = 7.0
 
-    # Blocker understanding
-    blocking_condition: Optional[str] = None
-    blocking_reason: Optional[str] = None
-
-    # Action recommendation
-    recommended_action: Optional[str] = None
-    action_reasoning: Optional[str] = None
-    alternative_actions: List[str] = field(default_factory=list)
-
-    # State suggestions
-    important_state_variables: List[str] = field(default_factory=list)
-
-    # Confidence (self-reported by LLM, take with grain of salt)
-    confidence: float = 0.5
-
-    @classmethod
-    def from_json(cls, data: Dict) -> 'SituationUnderstanding':
-        """Parse from LLM JSON response."""
-        return cls(
-            overall_goal=data.get("overall_goal"),
-            immediate_goal=data.get("immediate_goal"),
-            accomplished=data.get("accomplished", []),
-            progress_made=data.get("progress_made", False),
-            blocking_condition=data.get("blocking_condition"),
-            blocking_reason=data.get("blocking_reason"),
-            recommended_action=data.get("recommended_action"),
-            action_reasoning=data.get("action_reasoning"),
-            alternative_actions=data.get("alternative_actions", []),
-            important_state_variables=data.get("important_state_variables", []),
-            confidence=data.get("confidence", 0.5),
-        )
-
-
-# =============================================================================
-# ORACLE RELIABILITY TRACKING (v3)
-# =============================================================================
-
-@dataclass
-class OracleReliability:
-    """
-    Track how reliable different types of LLM responses are.
-
-    We learn this from experience.
-    """
-
-    # Recommendation accuracy: when LLM recommends action, does it help?
-    recommendations_followed: int = 0
-    recommendations_helped: int = 0
-
-    # Goal inference accuracy: does pursuing inferred goals lead to score?
-    goals_pursued: int = 0
-    goals_achieved: int = 0
-
-    # Blocker analysis accuracy: when LLM says X blocks, does fixing X help?
-    blockers_identified: int = 0
-    blockers_resolved: int = 0
-
-    # State suggestion utility: do suggested variables reduce contradictions?
-    variables_suggested: int = 0
-    variables_useful: int = 0
+    # Query count (for diagnostics)
+    query_count: int = 0
+    ground_truth_count: int = 0
 
     @property
-    def recommendation_accuracy(self) -> float:
-        if self.recommendations_followed == 0:
-            return 0.5  # Prior
-        return self.recommendations_helped / self.recommendations_followed
+    def tpr(self) -> float:
+        """Expected true positive rate."""
+        return self.tp_alpha / (self.tp_alpha + self.tp_beta)
 
     @property
-    def goal_accuracy(self) -> float:
-        if self.goals_pursued == 0:
-            return 0.5
-        return self.goals_achieved / self.goals_pursued
+    def fpr(self) -> float:
+        """Expected false positive rate."""
+        return self.fp_alpha / (self.fp_alpha + self.fp_beta)
 
     @property
-    def blocker_accuracy(self) -> float:
-        if self.blockers_identified == 0:
-            return 0.5
-        return self.blockers_resolved / self.blockers_identified
+    def reliability(self) -> float:
+        """Overall reliability score (TPR - FPR). Ranges from -1 to 1."""
+        return self.tpr - self.fpr
 
-    def update_recommendation(self, helped: bool):
-        self.recommendations_followed += 1
-        if helped:
-            self.recommendations_helped += 1
+    def update(self, said_yes: bool, was_true: bool):
+        """Update reliability from ground truth."""
+        self.ground_truth_count += 1
 
-    def get_summary(self) -> Dict:
+        if was_true:
+            if said_yes:
+                self.tp_alpha += 1  # True positive
+            else:
+                self.tp_beta += 1   # False negative
+        else:
+            if said_yes:
+                self.fp_alpha += 1  # False positive
+            else:
+                self.fp_beta += 1   # True negative
+
+    def posterior(self, prior: float, said_yes: bool) -> float:
+        """
+        P(true | LLM response) via Bayes' rule.
+
+        Args:
+            prior: P(true) before observing LLM response
+            said_yes: Whether LLM said yes
+
+        Returns:
+            P(true | LLM response)
+        """
+        if said_yes:
+            p_yes_if_true = self.tpr
+            p_yes_if_false = self.fpr
+
+            numerator = p_yes_if_true * prior
+            denominator = p_yes_if_true * prior + p_yes_if_false * (1 - prior)
+        else:
+            p_no_if_true = 1 - self.tpr
+            p_no_if_false = 1 - self.fpr
+
+            numerator = p_no_if_true * prior
+            denominator = p_no_if_true * prior + p_no_if_false * (1 - prior)
+
+        if denominator == 0:
+            return prior
+
+        return numerator / denominator
+
+    def get_stats(self) -> dict:
         return {
-            "recommendation_accuracy": self.recommendation_accuracy,
-            "goal_accuracy": self.goal_accuracy,
-            "blocker_accuracy": self.blocker_accuracy,
-            "total_recommendations": self.recommendations_followed,
+            "tpr": self.tpr,
+            "fpr": self.fpr,
+            "reliability": self.reliability,
+            "queries": self.query_count,
+            "ground_truths": self.ground_truth_count,
         }
 
 
 # =============================================================================
-# DYNAMICS MODEL (unchanged from v2)
+# QUESTION TYPES
 # =============================================================================
+
+class QuestionType(Enum):
+    ACTION_HELPS = "action_helps"       # "Will action X make progress?"
+    IN_LOCATION = "in_location"         # "Am I in the bedroom?"
+    HAVE_ITEM = "have_item"             # "Do I have the keys?"
+    STATE_FLAG = "state_flag"           # "Is the door locked?"
+    GOAL_DONE = "goal_done"             # "Have I answered the phone?"
+    PREREQ_MET = "prereq_met"           # "Can I go east?"
+    ACTION_POSSIBLE = "action_possible" # "Is 'open door' available?"
+
+
+# =============================================================================
+# LLM SENSOR BANK
+# =============================================================================
+
+class LLMSensorBank:
+    """
+    The LLM as a collection of binary sensors.
+
+    Each question type has independently learned reliability.
+    LLM client is injected — this class remains stdlib-only.
+    """
+
+    def __init__(self, llm_client):
+        self.llm = llm_client
+
+        self.sensors: Dict[QuestionType, BinarySensor] = {
+            QuestionType.ACTION_HELPS: BinarySensor(tp_alpha=6, tp_beta=4, fp_alpha=3, fp_beta=7),
+            QuestionType.IN_LOCATION: BinarySensor(tp_alpha=8, tp_beta=2, fp_alpha=1, fp_beta=9),
+            QuestionType.HAVE_ITEM: BinarySensor(tp_alpha=8, tp_beta=2, fp_alpha=1, fp_beta=9),
+            QuestionType.STATE_FLAG: BinarySensor(tp_alpha=6, tp_beta=4, fp_alpha=2, fp_beta=8),
+            QuestionType.GOAL_DONE: BinarySensor(tp_alpha=6, tp_beta=4, fp_alpha=2, fp_beta=8),
+            QuestionType.PREREQ_MET: BinarySensor(tp_alpha=5, tp_beta=5, fp_alpha=3, fp_beta=7),
+            QuestionType.ACTION_POSSIBLE: BinarySensor(tp_alpha=7, tp_beta=3, fp_alpha=2, fp_beta=8),
+        }
+
+        # Cache to avoid redundant queries within same turn
+        self.query_cache: Dict[str, bool] = {}
+
+    def ask(
+        self,
+        question_type: QuestionType,
+        question: str,
+        context: str = "",
+    ) -> Tuple[bool, float]:
+        """
+        Ask a yes/no question.
+
+        Returns: (answer, reliability)
+        """
+        cache_key = f"{question_type.value}:{question}"
+
+        if cache_key in self.query_cache:
+            return self.query_cache[cache_key], self.sensors[question_type].reliability
+
+        answer = self._query_llm(question, context)
+
+        self.sensors[question_type].query_count += 1
+
+        self.query_cache[cache_key] = answer
+
+        return answer, self.sensors[question_type].reliability
+
+    def update_from_ground_truth(
+        self,
+        question_type: QuestionType,
+        said_yes: bool,
+        actual_truth: bool,
+    ):
+        """Update sensor reliability from observed ground truth."""
+        self.sensors[question_type].update(said_yes, actual_truth)
+
+    def get_posterior(
+        self,
+        question_type: QuestionType,
+        prior: float,
+        said_yes: bool,
+    ) -> float:
+        """Compute posterior probability given sensor reading."""
+        return self.sensors[question_type].posterior(prior, said_yes)
+
+    def clear_cache(self):
+        """Clear query cache (call at start of each turn)."""
+        self.query_cache = {}
+
+    def _query_llm(self, question: str, context: str) -> bool:
+        """Query LLM for yes/no answer."""
+        prompt = f"""Answer this question about a text adventure game with only YES or NO.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer (YES or NO):"""
+
+        response = self.llm.complete(prompt).strip().upper()
+
+        return response.startswith("YES")
+
+    def get_all_stats(self) -> Dict[str, dict]:
+        return {qt.value: sensor.get_stats() for qt, sensor in self.sensors.items()}
+
+
+# =============================================================================
+# BELIEF STATE
+# =============================================================================
+
+@dataclass
+class BeliefState:
+    """
+    Agent's beliefs as probability distributions.
+
+    Each belief is a probability that something is true.
+    Updated via Bayes' rule from sensor readings and direct observations.
+    """
+
+    location_beliefs: Dict[str, float] = field(default_factory=dict)
+    current_location: Optional[str] = None
+
+    inventory_beliefs: Dict[str, float] = field(default_factory=dict)
+
+    flag_beliefs: Dict[str, float] = field(default_factory=dict)
+
+    goal_beliefs: Dict[str, float] = field(default_factory=dict)
+
+    action_beliefs: Dict[str, float] = field(default_factory=dict)
+
+    def update_belief(self, belief_name: str, category: str, new_probability: float):
+        """Update a belief to a new probability."""
+        beliefs_map = {
+            "location": self.location_beliefs,
+            "inventory": self.inventory_beliefs,
+            "flag": self.flag_beliefs,
+            "goal": self.goal_beliefs,
+            "action": self.action_beliefs,
+        }
+        target = beliefs_map.get(category)
+        if target is not None:
+            target[belief_name] = new_probability
+            if category == "location" and self.location_beliefs:
+                self.current_location = max(
+                    self.location_beliefs, key=lambda k: self.location_beliefs[k]
+                )
+
+    def get_belief(self, belief_name: str, category: str, default: float = 0.5) -> float:
+        """Get current belief probability."""
+        beliefs_map = {
+            "location": self.location_beliefs,
+            "inventory": self.inventory_beliefs,
+            "flag": self.flag_beliefs,
+            "goal": self.goal_beliefs,
+            "action": self.action_beliefs,
+        }
+        target = beliefs_map.get(category)
+        if target is not None:
+            return target.get(belief_name, default)
+        return default
+
+    def set_certain(self, belief_name: str, category: str, value: bool):
+        """Set a belief to certainty (from direct observation)."""
+        self.update_belief(belief_name, category, 1.0 if value else 0.0)
+
+    def to_context_string(self) -> str:
+        """Format beliefs for LLM context."""
+        lines = []
+
+        if self.current_location:
+            conf = self.location_beliefs.get(self.current_location, 0)
+            lines.append(f"Location: {self.current_location} (confidence: {conf:.0%})")
+
+        has_items = [item for item, p in self.inventory_beliefs.items() if p > 0.7]
+        if has_items:
+            lines.append(f"Inventory: {', '.join(has_items)}")
+
+        true_flags = [flag for flag, p in self.flag_beliefs.items() if p > 0.7]
+        if true_flags:
+            lines.append(f"Known state: {', '.join(true_flags)}")
+
+        done_goals = [goal for goal, p in self.goal_beliefs.items() if p > 0.7]
+        if done_goals:
+            lines.append(f"Accomplished: {', '.join(done_goals)}")
+
+        return "\n".join(lines) if lines else "No confident beliefs yet."
+
+
+# =============================================================================
+# DYNAMICS MODEL
+# =============================================================================
+
+@dataclass(frozen=True)
+class StateActionKey:
+    """Hashable key for state-action pairs."""
+    state_hash: str
+    action: str
+
+
+@dataclass
+class ObservedOutcome:
+    """What we observed when taking an action."""
+    next_state_hash: str
+    reward: float
+    observation_text: str = ""
+
 
 class DynamicsModel:
     """
-    Learns P(next_state, reward | current_state, action).
+    Learned dynamics from direct experience.
 
-    Uses a simple count-based model with pseudocounts for smoothing.
+    In a deterministic game, one observation = certainty.
     """
 
-    def __init__(self, prior_pseudocount: float = 0.1):
-        self.prior_pseudocount = prior_pseudocount
+    def __init__(self):
+        self.observations: Dict[StateActionKey, ObservedOutcome] = {}
+        self.tried_actions: Set[str] = set()
+        self.total_observations: int = 0
 
-        # Counts: (state, action) -> {(next_state, reward): count}
-        self.transition_counts: Dict[Tuple[GameState, str], Dict[Tuple[GameState, float], float]] = \
-            defaultdict(lambda: defaultdict(lambda: self.prior_pseudocount))
+    def has_observation(self, state_hash: str, action: str) -> bool:
+        """Have we tried this action in this state?"""
+        return StateActionKey(state_hash, action) in self.observations
 
-        # Total counts per (state, action) for normalisation
-        self.total_counts: Dict[Tuple[GameState, str], float] = \
-            defaultdict(lambda: self.prior_pseudocount)
+    def get_observation(self, state_hash: str, action: str) -> Optional[ObservedOutcome]:
+        """Get observed outcome if we have one."""
+        return self.observations.get(StateActionKey(state_hash, action))
 
-        # Track what we've actually observed (vs just prior)
-        self.observed_transitions: Set[Tuple[GameState, str, GameState, float]] = set()
-
-        # Full transition history for contradiction detection
-        self.history: List[Transition] = []
-
-    def update(self, state: GameState, action: str, next_state: GameState,
-               reward: float, raw_observation: str = ""):
-        """Record an observed transition."""
-        key = (state, action)
-        outcome = (next_state, reward)
-
-        self.transition_counts[key][outcome] += 1.0
-        self.total_counts[key] += 1.0
-        self.observed_transitions.add((state, action, next_state, reward))
-
-        self.history.append(Transition(
-            state=state, action=action, next_state=next_state,
-            reward=reward, raw_observation=raw_observation
-        ))
-
-    def predict(self, state: GameState, action: str) -> Dict[Tuple[GameState, float], float]:
-        """
-        P(next_state, reward | state, action)
-
-        Returns distribution over (next_state, reward) pairs.
-        """
-        key = (state, action)
-        total = self.total_counts[key]
-
-        if total <= self.prior_pseudocount:
-            return {}
-
-        return {
-            outcome: count / total
-            for outcome, count in self.transition_counts[key].items()
-        }
-
-    def sample_outcome(self, state: GameState, action: str) -> Optional[Tuple[GameState, float]]:
-        """Sample from P(outcome | state, action). For Thompson sampling."""
-        dist = self.predict(state, action)
-        if not dist:
-            return None
-
-        outcomes, probs = zip(*dist.items())
-        return random.choices(outcomes, probs)[0]
-
-    def expected_reward(self, state: GameState, action: str) -> float:
-        """E[reward | state, action]"""
-        dist = self.predict(state, action)
-        if not dist:
-            return 0.0
-        return sum(prob * reward for (_, reward), prob in dist.items())
-
-    def uncertainty(self, state: GameState, action: str) -> float:
-        """
-        How uncertain are we about this transition?
-
-        Returns entropy of the distribution, or high value if no observations.
-        """
-        dist = self.predict(state, action)
-        if not dist:
-            return 10.0
-        return -sum(p * math.log(p + 1e-10) for p in dist.values())
-
-    def observation_count(self, state, action: str) -> int:
-        """How many times have we seen this (state, action) pair?"""
-        if isinstance(state, GameState):
-            key = (state, action)
-        else:
-            # Accept AgentBeliefs via to_state_key()
-            key = (state.to_state_key(), action)
-        total = self.total_counts[key]
-        return max(0, int(total - self.prior_pseudocount))
-
-    def get_outcome_counts(self, state: GameState, action: str) -> Dict[Tuple[GameState, float], int]:
-        """Return actual observation counts (excluding pseudocounts) for each outcome."""
-        key = (state, action)
-        return {
-            outcome: max(0, int(count - self.prior_pseudocount))
-            for outcome, count in self.transition_counts[key].items()
-            if count > self.prior_pseudocount
-        }
-
-
-# =============================================================================
-# BELIEF UPDATER (v3)
-# =============================================================================
-
-class BeliefUpdater:
-    """
-    Updates agent beliefs based on LLM observations.
-
-    Weights updates by learned reliability.
-    """
-
-    def __init__(self, reliability: OracleReliability):
-        self.reliability = reliability
-
-    def update_from_understanding(
+    def record_observation(
         self,
-        beliefs: AgentBeliefs,
-        understanding: SituationUnderstanding,
-    ) -> AgentBeliefs:
-        """
-        Update beliefs based on LLM's situation analysis.
-
-        More reliable sources get more weight.
-        """
-        # Goal updates - always incorporate (hard to verify, but useful)
-        if understanding.overall_goal and beliefs.overall_goal == "unknown":
-            beliefs.overall_goal = understanding.overall_goal
-
-        if understanding.immediate_goal:
-            beliefs.current_subgoal = understanding.immediate_goal
-
-        # Progress updates - incorporate if confidence is high
-        if understanding.confidence > 0.6:
-            for item in understanding.accomplished:
-                if item not in beliefs.accomplished:
-                    beliefs.accomplished.append(item)
-
-        # Blocker updates - very useful for planning
-        if understanding.blocking_condition:
-            beliefs.blocking_condition = understanding.blocking_condition
-
-        return beliefs
-
-    def update_from_failure_analysis(
-        self,
-        beliefs: AgentBeliefs,
+        state_hash: str,
         action: str,
-        analysis: Dict,
-    ) -> AgentBeliefs:
-        """Update beliefs based on failure analysis."""
-        if "failure_reason" in analysis:
-            beliefs.failed_actions[action] = analysis["failure_reason"]
-
-        if "prerequisite" in analysis and analysis["prerequisite"]:
-            beliefs.blocking_condition = analysis["prerequisite"]
-
-        return beliefs
-
-    def update_from_progress(
-        self,
-        beliefs: AgentBeliefs,
-        progress: Dict,
-    ) -> AgentBeliefs:
-        """Update beliefs based on progress detection."""
-        if progress.get("made_progress") and progress.get("accomplishment"):
-            accomplishment = progress["accomplishment"]
-            if accomplishment not in beliefs.accomplished:
-                beliefs.accomplished.append(accomplishment)
-
-        # Clear blocker if we made progress
-        if progress.get("made_progress"):
-            beliefs.blocking_condition = None
-
-        return beliefs
-
-
-# =============================================================================
-# ACTION SELECTION (v3)
-# =============================================================================
-
-class InformedActionSelector:
-    """
-    Selects actions using LLM understanding + learned dynamics.
-
-    Oracle is injected — this class remains stdlib-only.
-    When oracle is None, falls back to dynamics-only + random exploration.
-    """
-
-    def __init__(
-        self,
-        oracle=None,
-        reliability: Optional[OracleReliability] = None,
-        dynamics: Optional[DynamicsModel] = None,
-        exploration_rate: float = 0.2,
+        next_state_hash: str,
+        reward: float,
+        observation_text: str = "",
     ):
-        self.oracle = oracle
-        self.reliability = reliability or OracleReliability()
-        self.dynamics = dynamics or DynamicsModel()
-        self.exploration_rate = exploration_rate
-
-        # Cache current understanding
-        self.current_understanding: Optional[SituationUnderstanding] = None
-
-    def select_action(
-        self,
-        observation: str,
-        beliefs: AgentBeliefs,
-        valid_actions: List[str],
-    ) -> Tuple[str, str]:
-        """
-        Select action based on LLM understanding and learned dynamics.
-
-        Returns: (action, reason)
-        """
-        if not valid_actions:
-            return "look", "no valid actions available"
-
-        # Get LLM's situation analysis if oracle available
-        if self.oracle is not None:
-            understanding = self.oracle.analyse_situation(
-                observation, beliefs, valid_actions
-            )
-            self.current_understanding = understanding
-        else:
-            understanding = SituationUnderstanding()
-            self.current_understanding = understanding
-
-        # Decision hierarchy:
-
-        # 1. If LLM has high-confidence recommendation, probably follow it
-        if (understanding.recommended_action and
-                understanding.confidence > 0.6 and
-                self.reliability.recommendation_accuracy > 0.4):
-
-            rec = understanding.recommended_action.lower()
-            for action in valid_actions:
-                if action.lower() == rec or rec in action.lower() or action.lower() in rec:
-                    # Follow recommendation with probability based on reliability
-                    if random.random() < 0.7 + 0.3 * self.reliability.recommendation_accuracy:
-                        return action, f"LLM recommended: {understanding.action_reasoning}"
-
-        # 2. If we have a blocker, try to address it
-        if understanding.blocking_condition:
-            for action in valid_actions:
-                if self._action_addresses_blocker(action, understanding.blocking_condition):
-                    return action, f"addressing blocker: {understanding.blocking_condition}"
-
-        # 3. Use dynamics model for actions we have experience with
-        state_key = beliefs.to_state_key()
-        experienced_actions = [
-            a for a in valid_actions
-            if self.dynamics.observation_count(state_key, a) > 0
-        ]
-
-        if experienced_actions and random.random() > self.exploration_rate:
-            best_action = max(
-                experienced_actions,
-                key=lambda a: self.dynamics.expected_reward(state_key, a)
-            )
-            return best_action, "best learned action"
-
-        # 4. Explore: prefer LLM's alternative suggestions
-        if understanding.alternative_actions:
-            for alt in understanding.alternative_actions:
-                for action in valid_actions:
-                    if alt.lower() in action.lower():
-                        return action, "exploring LLM alternative"
-
-        # 5. Random exploration
-        return random.choice(valid_actions), "random exploration"
-
-    def _action_addresses_blocker(self, action: str, blocker: str) -> bool:
-        """Heuristic: does this action seem to address the blocker?"""
-        action_lower = action.lower()
-        blocker_lower = blocker.lower()
-
-        # Simple keyword matching
-        keywords = blocker_lower.split()
-        for word in keywords:
-            if len(word) > 3 and word in action_lower:
-                return True
-
-        # Common patterns
-        if "stand" in blocker_lower and "stand" in action_lower:
-            return True
-        if "dress" in blocker_lower and ("wear" in action_lower or "dress" in action_lower):
-            return True
-        if "door" in blocker_lower and ("open" in action_lower or "unlock" in action_lower):
-            return True
-
-        return False
-
-
-# =============================================================================
-# THE AGENT (v3)
-# =============================================================================
-
-class BayesianIFAgent:
-    """
-    Bayesian agent for interactive fiction with rich LLM oracle integration.
-
-    The LLM helps understand. The agent decides.
-
-    Oracle is injected at construction — core.py never imports oracle.py.
-    When oracle is None, falls back to dynamics-only exploration.
-    """
-
-    def __init__(
-        self,
-        oracle=None,
-        exploration_rate: float = 0.2,
-    ):
-        self.beliefs = AgentBeliefs()
-        self.reliability = OracleReliability()
-        self.dynamics = DynamicsModel()
-        self.action_selector = InformedActionSelector(
-            oracle=oracle,
-            reliability=self.reliability,
-            dynamics=self.dynamics,
-            exploration_rate=exploration_rate,
+        """Record an observed outcome."""
+        key = StateActionKey(state_hash, action)
+        self.observations[key] = ObservedOutcome(
+            next_state_hash=next_state_hash,
+            reward=reward,
+            observation_text=observation_text,
         )
-        self.belief_updater = BeliefUpdater(self.reliability)
+        self.tried_actions.add(action)
+        self.total_observations += 1
 
-        # Episode tracking
-        self.episode_count = 0
-        self.previous_observation = ""
-        self.previous_action = ""
-        self.previous_score = 0
+    def known_reward(self, state_hash: str, action: str) -> Optional[float]:
+        """Get known reward for state-action pair. None if unobserved."""
+        obs = self.get_observation(state_hash, action)
+        return obs.reward if obs else None
 
-    def reset_episode(self):
-        """Reset for new episode, keeping learned knowledge."""
-        self.beliefs = AgentBeliefs(
-            overall_goal=self.beliefs.overall_goal,  # Keep learned goal
-        )
-        self.previous_observation = ""
-        self.previous_action = ""
-        self.previous_score = 0
-
-    def choose_action(self, observation: str, valid_actions: List[str]) -> str:
-        """
-        Choose action using LLM understanding + Bayesian reasoning.
-
-        Returns the chosen action string.
-        """
-        action, reason = self.action_selector.select_action(
-            observation, self.beliefs, valid_actions
-        )
-
-        # Record for learning
-        self.previous_observation = observation
-        self.previous_action = action
-
-        # Update action history
-        self.beliefs.action_history.append(action)
-        if len(self.beliefs.action_history) > 50:
-            self.beliefs.action_history = self.beliefs.action_history[-50:]
-
-        return action
-
-    def observe_outcome(self, observation: str, reward: float, score: int):
-        """
-        Learn from outcome.
-
-        Updates beliefs, reliability tracking, and dynamics model.
-        """
-        score_change = score - self.previous_score
-
-        # Detect progress using oracle
-        progress = {"made_progress": False}
-        if self.action_selector.oracle is not None and self.previous_action:
-            progress = self.action_selector.oracle.detect_progress(
-                self.previous_observation,
-                self.previous_action,
-                observation,
-                score_change,
-            )
-
-        # Update beliefs from progress
-        self.beliefs = self.belief_updater.update_from_progress(
-            self.beliefs, progress
-        )
-
-        # Update reliability tracking
-        understanding = self.action_selector.current_understanding
-        if understanding and understanding.recommended_action:
-            was_recommended = (
-                self.previous_action.lower() in understanding.recommended_action.lower() or
-                understanding.recommended_action.lower() in self.previous_action.lower()
-            )
-            if was_recommended:
-                self.reliability.update_recommendation(
-                    helped=progress.get("made_progress", False) or score_change > 0
-                )
-
-        # Analyse failure if action didn't seem to work
-        if (not progress.get("made_progress") and score_change <= 0
-                and self.action_selector.oracle is not None and self.previous_action):
-            failure_analysis = self.action_selector.oracle.analyse_failure(
-                self.previous_observation,
-                self.beliefs,
-                self.previous_action,
-                observation,
-            )
-            self.beliefs = self.belief_updater.update_from_failure_analysis(
-                self.beliefs, self.previous_action, failure_analysis
-            )
-
-        # Update dynamics model
-        if self.previous_action:
-            prev_state_key = self.beliefs.to_state_key()
-            # After ground truth update, derive new state key
-            new_state_key = self.beliefs.to_state_key()
-            self.dynamics.update(
-                prev_state_key, self.previous_action, new_state_key,
-                reward, observation,
-            )
-
-        # Update observation history
-        self.beliefs.observation_history.append(observation[:200])
-        if len(self.beliefs.observation_history) > 20:
-            self.beliefs.observation_history = self.beliefs.observation_history[-20:]
-
-        self.previous_score = score
-
-    def update_beliefs_from_ground_truth(
-        self,
-        location: str,
-        location_id: int,
-        inventory: List[str],
-        world_hash: str,
-    ):
-        """Update beliefs from Jericho ground truth."""
-        self.beliefs.location = location
-        self.beliefs._location_id = location_id
-        self.beliefs.inventory = list(inventory)
-        self.beliefs._world_hash = world_hash
-
-    def get_statistics(self) -> Dict:
-        """Return statistics about the agent's learning."""
+    def get_stats(self) -> dict:
         return {
-            "episode_count": self.episode_count,
-            "transitions_learned": len(self.dynamics.observed_transitions),
-            "dynamics_history_size": len(self.dynamics.history),
-            "overall_goal": self.beliefs.overall_goal,
-            "accomplished": self.beliefs.accomplished,
-            "reliability": self.reliability.get_summary(),
+            "total_observations": self.total_observations,
+            "unique_state_actions": len(self.observations),
+            "unique_actions_tried": len(self.tried_actions),
         }
+
+
+# =============================================================================
+# UNIFIED DECISION MAKER
+# =============================================================================
+
+class UnifiedDecisionMaker:
+    """
+    Unified decision-making over game actions and LLM queries.
+
+    Both action types evaluated by expected utility.
+    """
+
+    def __init__(self, question_cost: float = 0.01, action_cost: float = 0.10, action_prior: float = 0.15):
+        """
+        Args:
+            question_cost: Cost of asking one LLM question (in reward units).
+            action_cost: Cost of taking a game action (models limited turns).
+            action_prior: Default P(action helps) for untried actions.
+                          Most IF actions don't help — 0.15 is conservative.
+        """
+        self.question_cost = question_cost
+        self.action_cost = action_cost
+        self.action_prior = action_prior
+
+    def choose(
+        self,
+        game_actions: List[str],
+        possible_questions: List[Tuple[str, str]],  # (action, question)
+        beliefs: Dict[str, float],
+        sensor: BinarySensor,
+        dynamics: 'DynamicsModel',
+        state_hash: str,
+    ) -> Tuple[str, Any]:
+        """
+        Choose between asking a question or taking a game action.
+
+        Returns: ('ask', (action, question)) or ('take', action)
+        """
+        # Compute EU for all game actions
+        game_eus = {}
+        for action in game_actions:
+            known = dynamics.known_reward(state_hash, action)
+            if known is not None:
+                game_eus[action] = known - self.action_cost
+            else:
+                belief = beliefs.get(action, self.action_prior)
+                game_eus[action] = belief * 1.0 - self.action_cost
+
+        best_game_action = max(game_actions, key=lambda a: game_eus[a])
+        best_game_eu = game_eus[best_game_action]
+
+        # Compute EU for all questions (VOI - cost)
+        best_question = None
+        best_question_eu = float('-inf')
+
+        for action, question in possible_questions:
+            if dynamics.has_observation(state_hash, action):
+                continue
+
+            belief = beliefs.get(action, self.action_prior)
+            voi = self.compute_voi(action, belief, sensor, game_eus)
+            question_eu = voi - self.question_cost
+
+            if question_eu > best_question_eu:
+                best_question_eu = question_eu
+                best_question = (action, question)
+
+        if best_question is not None and best_question_eu > best_game_eu:
+            return ('ask', best_question)
+        else:
+            return ('take', best_game_action)
+
+    def compute_voi(
+        self,
+        action: str,
+        current_belief: float,
+        sensor: BinarySensor,
+        all_game_eus: Dict[str, float],
+    ) -> float:
+        """
+        Compute value of information for asking about this action.
+
+        VOI = E[max EU after asking] - max EU now
+        """
+        current_best_eu = max(all_game_eus.values())
+
+        # P(LLM says yes)
+        p_yes = sensor.tpr * current_belief + sensor.fpr * (1 - current_belief)
+        p_no = 1 - p_yes
+
+        # Posterior beliefs after each answer
+        posterior_if_yes = sensor.posterior(current_belief, said_yes=True)
+        posterior_if_no = sensor.posterior(current_belief, said_yes=False)
+
+        # EU of this action under each posterior (includes action cost)
+        eu_if_yes = posterior_if_yes * 1.0 - self.action_cost
+        eu_if_no = posterior_if_no * 1.0 - self.action_cost
+
+        # Best EU achievable after each answer
+        other_best = max(
+            (eu for a, eu in all_game_eus.items() if a != action),
+            default=0.0
+        )
+
+        best_eu_if_yes = max(eu_if_yes, other_best)
+        best_eu_if_no = max(eu_if_no, other_best)
+
+        # Expected best EU after asking
+        expected_best_after = p_yes * best_eu_if_yes + p_no * best_eu_if_no
+
+        # VOI = improvement over current best
+        voi = expected_best_after - current_best_eu
+
+        return max(0.0, voi)
 
 
 # =============================================================================
@@ -720,103 +488,139 @@ class BayesianIFAgent:
 # =============================================================================
 
 if __name__ == "__main__":
-    print("Bayesian IF Agent v3 - Core Unit Tests")
+    print("Bayesian IF Agent v4 - Core Unit Tests")
     print("=" * 60)
 
-    # Test 1: GameState
-    state1 = GameState(location=5, inventory=frozenset(["keys"]), world_hash="abc123")
-    state2 = GameState(location=5, inventory=frozenset(["keys", "wallet"]), world_hash="def456")
-    print(f"State 1: {state1}")
-    print(f"State 2: {state2}")
-    assert state1 != state2
-    assert hash(state1) != hash(state2)
+    # Test 1: BinarySensor
+    sensor = BinarySensor()
+    assert abs(sensor.tpr - 0.7) < 0.01
+    assert abs(sensor.fpr - 0.3) < 0.01
+    assert abs(sensor.reliability - 0.4) < 0.01
+    print(f"Sensor: TPR={sensor.tpr:.2f}, FPR={sensor.fpr:.2f}, rel={sensor.reliability:.2f}")
 
-    initial = GameState.initial()
-    assert initial.location == 0
-    assert initial.inventory == frozenset()
-    print(f"Initial: {initial}")
+    # Update with true positive
+    sensor.update(said_yes=True, was_true=True)
+    assert sensor.tpr > 0.7
+    assert sensor.ground_truth_count == 1
+    print(f"After TP: TPR={sensor.tpr:.2f}, FPR={sensor.fpr:.2f}")
 
-    # Test 2: AgentBeliefs
-    beliefs = AgentBeliefs(location="bedroom", inventory=["keys", "phone"])
-    beliefs._location_id = 5
-    beliefs._world_hash = "abc"
-    ctx = beliefs.to_prompt_context()
+    # Posterior math
+    posterior = sensor.posterior(0.5, said_yes=True)
+    assert posterior > 0.5  # Saying yes should increase belief
+    posterior_no = sensor.posterior(0.5, said_yes=False)
+    assert posterior_no < 0.5  # Saying no should decrease belief
+    print(f"Posterior(0.5, yes)={posterior:.3f}, Posterior(0.5, no)={posterior_no:.3f}")
+
+    # Test 2: QuestionType
+    assert len(QuestionType) == 7
+    assert QuestionType.ACTION_HELPS.value == "action_helps"
+    print(f"\nQuestionTypes: {[qt.value for qt in QuestionType]}")
+
+    # Test 3: LLMSensorBank with mock
+    class MockLLM:
+        def complete(self, prompt):
+            return "YES"
+
+    bank = LLMSensorBank(MockLLM())
+    answer, rel = bank.ask(QuestionType.ACTION_HELPS, "Will 'go north' help?", "In a room.")
+    assert answer is True
+    assert isinstance(rel, float)
+    print(f"\nSensorBank ask: answer={answer}, reliability={rel:.2f}")
+
+    # Cache hit
+    answer2, _ = bank.ask(QuestionType.ACTION_HELPS, "Will 'go north' help?", "In a room.")
+    assert answer2 == answer
+    bank.clear_cache()
+    print("Cache works correctly")
+
+    # Ground truth update
+    bank.update_from_ground_truth(QuestionType.ACTION_HELPS, said_yes=True, actual_truth=True)
+    stats = bank.get_all_stats()
+    assert stats["action_helps"]["ground_truths"] == 1
+    print(f"Sensor stats: {stats['action_helps']}")
+
+    # Test 4: BeliefState
+    beliefs = BeliefState()
+    assert beliefs.to_context_string() == "No confident beliefs yet."
+
+    beliefs.update_belief("bedroom", "location", 0.9)
+    assert beliefs.current_location == "bedroom"
+    assert beliefs.get_belief("bedroom", "location") == 0.9
+    assert beliefs.get_belief("kitchen", "location") == 0.5  # default
+
+    beliefs.set_certain("keys", "inventory", True)
+    assert beliefs.get_belief("keys", "inventory") == 1.0
+
+    beliefs.set_certain("wallet", "inventory", False)
+    assert beliefs.get_belief("wallet", "inventory") == 0.0
+
+    ctx = beliefs.to_context_string()
     assert "bedroom" in ctx
     assert "keys" in ctx
-    key = beliefs.to_state_key()
-    assert key.location == 5
-    assert "keys" in key.inventory
     print(f"\nBeliefs context:\n{ctx}")
-    print(f"State key: {key}")
 
-    # Test 3: SituationUnderstanding from JSON
-    su = SituationUnderstanding.from_json({
-        "overall_goal": "escape the house",
-        "immediate_goal": "get dressed",
-        "recommended_action": "stand up",
-        "confidence": 0.8,
-    })
-    assert su.overall_goal == "escape the house"
-    assert su.confidence == 0.8
-    print(f"\nUnderstanding: goal={su.overall_goal}, action={su.recommended_action}")
+    # Test 5: StateActionKey
+    key1 = StateActionKey("hash1", "go north")
+    key2 = StateActionKey("hash1", "go north")
+    assert key1 == key2
+    assert hash(key1) == hash(key2)
+    d = {key1: "value"}
+    assert d[key2] == "value"
+    print(f"\nStateActionKey: frozen and hashable")
 
-    # Test 4: OracleReliability
-    rel = OracleReliability()
-    assert rel.recommendation_accuracy == 0.5  # Prior
-    for _ in range(7):
-        rel.update_recommendation(helped=True)
-    for _ in range(3):
-        rel.update_recommendation(helped=False)
-    assert 0.6 < rel.recommendation_accuracy < 0.8
-    print(f"\nReliability: {rel.get_summary()}")
-
-    # Test 5: DynamicsModel (unchanged)
+    # Test 6: DynamicsModel
     dynamics = DynamicsModel()
-    dynamics.update(state1, "take wallet", state2, 0.0)
-    dynamics.update(state1, "take wallet", state2, 0.0)
-    pred = dynamics.predict(state1, "take wallet")
-    assert len(pred) > 0
-    print(f"\nDynamics prediction: {len(pred)} outcomes")
+    assert not dynamics.has_observation("s1", "go")
+    assert dynamics.known_reward("s1", "go") is None
 
-    # Test 6: BeliefUpdater
-    updater = BeliefUpdater(rel)
-    b = AgentBeliefs()
-    su2 = SituationUnderstanding(
-        overall_goal="win the game",
-        immediate_goal="find the key",
-        blocking_condition="door is locked",
-        confidence=0.9,
-        accomplished=["found map"],
+    dynamics.record_observation("s1", "go", "s2", 1.0, "You go north.")
+    assert dynamics.has_observation("s1", "go")
+    assert dynamics.known_reward("s1", "go") == 1.0
+    assert "go" in dynamics.tried_actions
+
+    # Overwrite (deterministic game)
+    dynamics.record_observation("s1", "go", "s2", 1.0, "You go north again.")
+    assert dynamics.total_observations == 2
+    stats = dynamics.get_stats()
+    assert stats["unique_state_actions"] == 1
+    print(f"\nDynamics stats: {stats}")
+
+    # Test 7: UnifiedDecisionMaker
+    dm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10, action_prior=0.15)
+
+    # When all actions known, should take best known
+    dynamics2 = DynamicsModel()
+    dynamics2.record_observation("s", "a1", "s2", 5.0)
+    dynamics2.record_observation("s", "a2", "s2", 0.0)
+
+    decision = dm.choose(
+        game_actions=["a1", "a2"],
+        possible_questions=[],
+        beliefs={"a1": 0.15, "a2": 0.15},
+        sensor=BinarySensor(),
+        dynamics=dynamics2,
+        state_hash="s",
     )
-    b = updater.update_from_understanding(b, su2)
-    assert b.overall_goal == "win the game"
-    assert b.blocking_condition == "door is locked"
-    assert "found map" in b.accomplished
-    print(f"\nUpdated beliefs: goal={b.overall_goal}, blocker={b.blocking_condition}")
+    assert decision == ('take', 'a1')
+    print(f"\nDecision (known): {decision}")
 
-    b = updater.update_from_progress(b, {"made_progress": True, "accomplishment": "opened door"})
-    assert b.blocking_condition is None
-    assert "opened door" in b.accomplished
-    print(f"After progress: blocker={b.blocking_condition}, accomplished={b.accomplished}")
+    # When actions unknown with reliable sensor, asking can win
+    dynamics3 = DynamicsModel()
+    sensor3 = BinarySensor(tp_alpha=9, tp_beta=1, fp_alpha=1, fp_beta=9)
 
-    # Test 7: InformedActionSelector (no oracle)
-    selector = InformedActionSelector(dynamics=dynamics, exploration_rate=0.3)
-    b2 = AgentBeliefs()
-    b2._location_id = 5
-    b2._world_hash = "abc123"
-    action, reason = selector.select_action("You are in a room.", b2, ["look", "go north", "take wallet"])
-    assert action in ["look", "go north", "take wallet"]
-    print(f"\nSelected action: {action} ({reason})")
+    decision2 = dm.choose(
+        game_actions=["a1", "a2"],
+        possible_questions=[("a1", "Will a1 help?"), ("a2", "Will a2 help?")],
+        beliefs={"a1": 0.15, "a2": 0.15},
+        sensor=sensor3,
+        dynamics=dynamics3,
+        state_hash="s",
+    )
+    print(f"Decision (unknown, reliable sensor): {decision2}")
 
-    # Test 8: BayesianIFAgent (no oracle)
-    agent = BayesianIFAgent(exploration_rate=0.2)
-    agent.update_beliefs_from_ground_truth("bedroom", 1, [], "h0")
-    action = agent.choose_action("You wake up.", ["stand up", "sleep", "look"])
-    print(f"\nAgent chose: {action}")
+    # VOI computation
+    voi = dm.compute_voi("a1", 0.15, sensor3, {"a1": 0.05, "a2": 0.05})
+    assert voi >= 0
+    print(f"VOI: {voi:.4f}")
 
-    agent.update_beliefs_from_ground_truth("bedroom", 1, [], "h1")
-    agent.observe_outcome("You stand up.", 0.0, 1)
-    stats = agent.get_statistics()
-    print(f"Agent stats: {stats}")
-
-    print("\nAll core v3 tests passed!")
+    print("\nAll core v4 tests passed!")
