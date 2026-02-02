@@ -7,19 +7,19 @@ from core import GameState, DynamicsModel
 from contradiction import detect_contradictions, Contradiction
 
 
-def _make_state(loc, inv=(), flags=()):
-    return GameState(loc, frozenset(inv), frozenset(flags))
+def _make_state(loc, inv=(), world_hash=""):
+    return GameState(loc, frozenset(inv), world_hash)
 
 
 # ---------------------------------------------------------------------------
-# Deterministic dynamics → no contradictions
+# Deterministic dynamics -> no contradictions
 # ---------------------------------------------------------------------------
 
 def test_no_contradictions_deterministic():
     """Same (state, action) always produces the same outcome."""
     dm = DynamicsModel()
-    s1 = _make_state("a")
-    s2 = _make_state("b")
+    s1 = _make_state(1, world_hash="a")
+    s2 = _make_state(2, world_hash="b")
 
     for _ in range(5):
         dm.update(s1, "go", s2, 1.0, "obs")
@@ -28,15 +28,15 @@ def test_no_contradictions_deterministic():
 
 
 # ---------------------------------------------------------------------------
-# Coarse state → contradictions detected
+# Coarse state -> contradictions detected
 # ---------------------------------------------------------------------------
 
 def test_contradictions_detected_different_outcomes():
     """Same (state, action) with different next_states triggers contradiction."""
     dm = DynamicsModel()
-    s = _make_state("room")
-    s_a = _make_state("room_a")
-    s_b = _make_state("room_b")
+    s = _make_state(1, world_hash="room")
+    s_a = _make_state(2, world_hash="room_a")
+    s_b = _make_state(3, world_hash="room_b")
 
     dm.update(s, "go", s_a, 0.0, "You enter room A.")
     dm.update(s, "go", s_b, 0.0, "You enter room B.")
@@ -52,9 +52,9 @@ def test_contradictions_detected_different_outcomes():
 def test_contradictions_threshold():
     """Outcomes below threshold count are ignored."""
     dm = DynamicsModel()
-    s = _make_state("room")
-    s_a = _make_state("a")
-    s_b = _make_state("b")
+    s = _make_state(1, world_hash="room")
+    s_a = _make_state(2, world_hash="a")
+    s_b = _make_state(3, world_hash="b")
 
     dm.update(s, "go", s_a, 0.0, "a")
     dm.update(s, "go", s_a, 0.0, "a")
@@ -68,18 +68,18 @@ def test_contradictions_threshold():
 
 
 # ---------------------------------------------------------------------------
-# Synthetic injection: multiple (state, action) pairs
+# Multiple (state, action) pairs
 # ---------------------------------------------------------------------------
 
 def test_multiple_contradictions():
     """Multiple (state, action) pairs can each have contradictions."""
     dm = DynamicsModel()
-    s1 = _make_state("r1")
-    s2 = _make_state("r2")
-    out_a = _make_state("a")
-    out_b = _make_state("b")
-    out_c = _make_state("c")
-    out_d = _make_state("d")
+    s1 = _make_state(1, world_hash="r1")
+    s2 = _make_state(2, world_hash="r2")
+    out_a = _make_state(10, world_hash="a")
+    out_b = _make_state(11, world_hash="b")
+    out_c = _make_state(12, world_hash="c")
+    out_d = _make_state(13, world_hash="d")
 
     dm.update(s1, "go", out_a, 0.0, "a")
     dm.update(s1, "go", out_b, 0.0, "b")
@@ -93,9 +93,9 @@ def test_multiple_contradictions():
 def test_same_reward_different_state_is_contradiction():
     """Different next_state with same reward still counts."""
     dm = DynamicsModel()
-    s = _make_state("start")
-    a = _make_state("end_a")
-    b = _make_state("end_b")
+    s = _make_state(1, world_hash="start")
+    a = _make_state(2, world_hash="end_a")
+    b = _make_state(3, world_hash="end_b")
 
     dm.update(s, "act", a, 5.0, "x")
     dm.update(s, "act", b, 5.0, "y")
@@ -107,8 +107,8 @@ def test_same_reward_different_state_is_contradiction():
 def test_different_reward_same_state_is_contradiction():
     """Same next_state with different reward still counts."""
     dm = DynamicsModel()
-    s = _make_state("start")
-    end = _make_state("end")
+    s = _make_state(1, world_hash="start")
+    end = _make_state(2, world_hash="end")
 
     dm.update(s, "act", end, 0.0, "no reward")
     dm.update(s, "act", end, 5.0, "reward!")
@@ -120,9 +120,9 @@ def test_different_reward_same_state_is_contradiction():
 def test_no_contradictions_different_actions():
     """Different actions from same state don't contradict each other."""
     dm = DynamicsModel()
-    s = _make_state("room")
-    s_a = _make_state("a")
-    s_b = _make_state("b")
+    s = _make_state(1, world_hash="room")
+    s_a = _make_state(2, world_hash="a")
+    s_b = _make_state(3, world_hash="b")
 
     dm.update(s, "go north", s_a, 0.0, "a")
     dm.update(s, "go south", s_b, 0.0, "b")

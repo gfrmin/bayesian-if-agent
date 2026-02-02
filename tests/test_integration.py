@@ -17,15 +17,15 @@ skip_no_game = pytest.mark.skipif(
 @skip_no_game
 def test_runner_walkthrough():
     """Play one episode using the game's walkthrough."""
-    from runner import JerichoRunner, EnhancedStateParser
+    from runner import JerichoRunner
     from core import BayesianIFAgent
 
     runner = JerichoRunner(GAME_PATH)
-    runner.agent = BayesianIFAgent(parser=EnhancedStateParser())
+    runner.agent = BayesianIFAgent(exploration_weight=0.2)
 
     stats = runner.play_episode(max_steps=50, verbose=False, use_walkthrough=True)
-    assert stats['total_steps'] > 0
-    assert stats['final_score'] >= 0
+    assert stats["total_steps"] > 0
+    assert stats["final_score"] >= 0
 
     runner.env.close()
 
@@ -33,45 +33,37 @@ def test_runner_walkthrough():
 @skip_no_game
 def test_runner_agent_play():
     """Play one episode with the agent choosing actions."""
-    from runner import JerichoRunner, EnhancedStateParser
+    from runner import JerichoRunner
     from core import BayesianIFAgent
 
     runner = JerichoRunner(GAME_PATH)
-    runner.agent = BayesianIFAgent(
-        parser=EnhancedStateParser(),
-        exploration_bonus=0.3,
-    )
+    runner.agent = BayesianIFAgent(exploration_weight=0.3)
 
     stats = runner.play_episode(max_steps=15, verbose=False)
-    assert stats['total_steps'] > 0
-    assert stats['agent_stats']['dynamics_history_size'] >= 0
+    assert stats["total_steps"] > 0
+    assert stats["agent_stats"]["dynamics_history_size"] >= 0
 
     runner.env.close()
 
 
 @skip_no_game
-def test_runner_multiple_episodes_with_expansion():
-    """Play multiple episodes with contradiction detection and expansion."""
-    from runner import JerichoRunner, EnhancedStateParser
+def test_runner_multiple_episodes():
+    """Play multiple episodes with contradiction detection."""
+    from runner import JerichoRunner
     from core import BayesianIFAgent
 
     runner = JerichoRunner(GAME_PATH)
-    runner.agent = BayesianIFAgent(
-        parser=EnhancedStateParser(),
-        exploration_bonus=0.3,
-    )
+    runner.agent = BayesianIFAgent(exploration_weight=0.3)
 
     summary = runner.play_multiple_episodes(
         n_episodes=3,
         max_steps_per_episode=15,
         verbose=False,
-        enable_expansion=True,
     )
 
-    assert summary['episodes'] == 3
-    assert 'total_contradictions_detected' in summary
-    assert 'variables_added' in summary
-    assert summary['final_transitions_learned'] >= 0
+    assert summary["episodes"] == 3
+    assert "total_contradictions_detected" in summary
+    assert summary["final_transitions_learned"] >= 0
 
     runner.env.close()
 
@@ -79,14 +71,11 @@ def test_runner_multiple_episodes_with_expansion():
 @skip_no_game
 def test_dynamics_history_grows_across_episodes():
     """Dynamics history should accumulate across episodes."""
-    from runner import JerichoRunner, EnhancedStateParser
+    from runner import JerichoRunner
     from core import BayesianIFAgent
 
     runner = JerichoRunner(GAME_PATH)
-    runner.agent = BayesianIFAgent(
-        parser=EnhancedStateParser(),
-        exploration_bonus=0.3,
-    )
+    runner.agent = BayesianIFAgent(exploration_weight=0.3)
 
     runner.play_episode(max_steps=10, verbose=False)
     history_after_1 = len(runner.agent.dynamics.history)
@@ -95,5 +84,30 @@ def test_dynamics_history_grows_across_episodes():
     history_after_2 = len(runner.agent.dynamics.history)
 
     assert history_after_2 > history_after_1
+
+    runner.env.close()
+
+
+@skip_no_game
+def test_runner_with_sensor():
+    """Play with a mock sensor to verify sensor integration."""
+    from runner import JerichoRunner
+    from core import BayesianIFAgent
+    from sensor_model import LLMSensorModel
+    from action_sensor import UniformActionSensor
+
+    sm = LLMSensorModel()
+    sensor = UniformActionSensor()
+
+    runner = JerichoRunner(GAME_PATH)
+    runner.agent = BayesianIFAgent(
+        sensor=sensor,
+        sensor_model=sm,
+        exploration_weight=0.3,
+    )
+
+    stats = runner.play_episode(max_steps=15, verbose=False)
+    assert stats["total_steps"] > 0
+    assert "sensor_stats" in stats["agent_stats"]
 
     runner.env.close()

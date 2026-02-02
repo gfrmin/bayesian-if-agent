@@ -10,7 +10,7 @@ All functions are pure (stdlib-only, no mutation).
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
 import math
-from core import BeliefState, DynamicsModel, ActionSelector
+from core import GameState, DynamicsModel, BayesianActionSelector
 
 
 @dataclass
@@ -48,7 +48,7 @@ def value_of_thinking(meta_state: MetaState, time_value: float) -> float:
     """
     Estimated value of one more deliberation step.
 
-    V(think) = P(changes_decision) × expected_improvement - time_cost
+    V(think) = P(changes_decision) * expected_improvement - time_cost
 
     P(changes_decision) decreases with more computation (diminishing returns).
     """
@@ -67,16 +67,17 @@ def should_keep_thinking(meta_state: MetaState, budget: ComputationBudget) -> bo
 
 
 def deliberate(
-    belief: BeliefState,
+    state: GameState,
     dynamics: DynamicsModel,
-    selector: ActionSelector,
+    selector: BayesianActionSelector,
     candidate_actions: List[str],
     budget: ComputationBudget,
+    observation: str = "",
 ) -> Tuple[str, MetaState]:
     """
     Run Thompson sampling iterations until V(act) > V(think) or budget exhausted.
 
-    Each iteration samples from the belief and dynamics posterior, accumulating
+    Each iteration samples from the dynamics posterior, accumulating
     action value estimates. Stops when further deliberation is not worth its cost.
 
     Returns (chosen_action, final_meta_state).
@@ -91,16 +92,9 @@ def deliberate(
     meta = MetaState()
 
     while True:
-        # One round of Thompson sampling: sample state, sample outcome per action
-        sampled_state = belief.sample()
-        if sampled_state is None:
-            # No belief — pick first action
-            meta.best_action = candidate_actions[0]
-            meta.best_action_value = 0.0
-            break
-
+        # One round of Thompson sampling: sample outcome per action
         for action in candidate_actions:
-            outcome = dynamics.sample_outcome(sampled_state, action)
+            outcome = dynamics.sample_outcome(state, action)
             value = outcome[1] if outcome else 0.0
             value_sums[action] += value
             value_counts[action] += 1
