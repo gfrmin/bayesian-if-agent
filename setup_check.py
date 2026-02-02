@@ -18,16 +18,16 @@ def check_dependencies():
     # Check jericho
     try:
         import jericho
-        print(f"  ✓ jericho {jericho.__version__}")
+        print(f"  jericho {jericho.__version__}")
     except ImportError as e:
-        errors.append(f"  ✗ jericho not installed: {e}")
+        errors.append(f"  jericho not installed: {e}")
 
     # Check requests
     try:
         import requests
-        print(f"  ✓ requests {requests.__version__}")
+        print(f"  requests {requests.__version__}")
     except ImportError as e:
-        errors.append(f"  ✗ requests not installed: {e}")
+        errors.append(f"  requests not installed: {e}")
 
     if errors:
         print("\nErrors found:")
@@ -47,12 +47,12 @@ def check_ollama():
         resp = requests.get("http://localhost:11434/api/tags", timeout=5)
         resp.raise_for_status()
         models = resp.json().get("models", [])
-        print(f"  ✓ Ollama running ({len(models)} models available)")
+        print(f"  Ollama running ({len(models)} models available)")
         for m in models[:5]:
             print(f"    - {m.get('name', 'unknown')}")
         return True
     except Exception:
-        print("  ✗ Ollama not running (LLM sensor will be disabled)")
+        print("  Ollama not running (oracle will be disabled)")
         print("    To enable: ollama serve && ollama pull llama3.1:8b")
         return False
 
@@ -62,10 +62,10 @@ def check_game_file(game_path: str = "games/905.z5") -> bool:
     print(f"\nChecking for game file: {game_path}")
 
     if os.path.exists(game_path):
-        print(f"  ✓ Found {game_path}")
+        print(f"  Found {game_path}")
         return True
     else:
-        print(f"  ✗ Game file not found: {game_path}")
+        print(f"  Game file not found: {game_path}")
         print("\n  To download 9:05:")
         print("    mkdir -p games")
         print('    curl -L "https://www.ifarchive.org/if-archive/games/zcode/905.z5" -o games/905.z5')
@@ -92,27 +92,38 @@ def quick_demo(game_path: str = "games/905.z5"):
 
     # Test agent
     print("\n" + "-" * 40)
-    print("Testing Bayesian agent...")
+    print("Testing Bayesian agent (v3)...")
 
-    from core import BayesianIFAgent, GameState
-    from runner import extract_state
+    from core import BayesianIFAgent
+    from runner import extract_beliefs_data
 
-    agent = BayesianIFAgent(exploration_weight=0.2)
-    state = extract_state(env)
-    agent.observe(state, obs, env.get_score())
+    agent = BayesianIFAgent(exploration_rate=0.2)
+    data = extract_beliefs_data(env)
+    agent.update_beliefs_from_ground_truth(
+        data["location"], data["location_id"],
+        data["inventory"], data["world_hash"],
+    )
 
-    print(f"State: {agent.current_state}")
+    print(f"Beliefs: {agent.beliefs.to_prompt_context()}")
 
     # Take a few actions
     print("\nTaking a few actions...")
     for i in range(3):
         valid = env.get_valid_actions()
-        action = agent.act(valid, observation=obs)
-        obs, reward, done, info = env.step(action)
-        state = extract_state(env)
-        agent.observe(state, obs, env.get_score())
+        action = agent.choose_action(obs, valid or ["look"])
 
-        print(f"  {i+1}. '{action}' -> score: {env.get_score()}, state: {agent.current_state}")
+        old_score = env.get_score()
+        obs, reward, done, info = env.step(action)
+        new_score = env.get_score()
+
+        data = extract_beliefs_data(env)
+        agent.update_beliefs_from_ground_truth(
+            data["location"], data["location_id"],
+            data["inventory"], data["world_hash"],
+        )
+        agent.observe_outcome(obs, reward, new_score)
+
+        print(f"  {i+1}. '{action}' -> score: {new_score}, location: {agent.beliefs.location}")
 
         if done:
             break
@@ -129,7 +140,7 @@ def quick_demo(game_path: str = "games/905.z5"):
 
 def main():
     print("=" * 60)
-    print("Bayesian IF Agent - Setup Verification")
+    print("Bayesian IF Agent v3 - Setup Verification")
     print("=" * 60)
 
     # Check dependencies

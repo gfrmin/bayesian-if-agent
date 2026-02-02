@@ -10,7 +10,7 @@ All functions are pure (stdlib-only, no mutation).
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
 import math
-from core import GameState, DynamicsModel, BayesianActionSelector
+from core import GameState, DynamicsModel
 
 
 @dataclass
@@ -69,7 +69,6 @@ def should_keep_thinking(meta_state: MetaState, budget: ComputationBudget) -> bo
 def deliberate(
     state: GameState,
     dynamics: DynamicsModel,
-    selector: BayesianActionSelector,
     candidate_actions: List[str],
     budget: ComputationBudget,
     observation: str = "",

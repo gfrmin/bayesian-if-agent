@@ -21,7 +21,7 @@ def test_runner_walkthrough():
     from core import BayesianIFAgent
 
     runner = JerichoRunner(GAME_PATH)
-    runner.agent = BayesianIFAgent(exploration_weight=0.2)
+    runner.agent = BayesianIFAgent(exploration_rate=0.2)
 
     stats = runner.play_episode(max_steps=50, verbose=False, use_walkthrough=True)
     assert stats["total_steps"] > 0
@@ -32,12 +32,12 @@ def test_runner_walkthrough():
 
 @skip_no_game
 def test_runner_agent_play():
-    """Play one episode with the agent choosing actions."""
+    """Play one episode with the agent choosing actions (no oracle)."""
     from runner import JerichoRunner
     from core import BayesianIFAgent
 
     runner = JerichoRunner(GAME_PATH)
-    runner.agent = BayesianIFAgent(exploration_weight=0.3)
+    runner.agent = BayesianIFAgent(exploration_rate=0.3)
 
     stats = runner.play_episode(max_steps=15, verbose=False)
     assert stats["total_steps"] > 0
@@ -53,7 +53,7 @@ def test_runner_multiple_episodes():
     from core import BayesianIFAgent
 
     runner = JerichoRunner(GAME_PATH)
-    runner.agent = BayesianIFAgent(exploration_weight=0.3)
+    runner.agent = BayesianIFAgent(exploration_rate=0.3)
 
     summary = runner.play_multiple_episodes(
         n_episodes=3,
@@ -75,11 +75,12 @@ def test_dynamics_history_grows_across_episodes():
     from core import BayesianIFAgent
 
     runner = JerichoRunner(GAME_PATH)
-    runner.agent = BayesianIFAgent(exploration_weight=0.3)
+    runner.agent = BayesianIFAgent(exploration_rate=0.3)
 
     runner.play_episode(max_steps=10, verbose=False)
     history_after_1 = len(runner.agent.dynamics.history)
 
+    runner.agent.reset_episode()
     runner.play_episode(max_steps=10, verbose=False)
     history_after_2 = len(runner.agent.dynamics.history)
 
@@ -89,25 +90,17 @@ def test_dynamics_history_grows_across_episodes():
 
 
 @skip_no_game
-def test_runner_with_sensor():
-    """Play with a mock sensor to verify sensor integration."""
+def test_runner_beliefs_updated():
+    """Agent beliefs should be updated from ground truth during play."""
     from runner import JerichoRunner
     from core import BayesianIFAgent
-    from sensor_model import LLMSensorModel
-    from action_sensor import UniformActionSensor
-
-    sm = LLMSensorModel()
-    sensor = UniformActionSensor()
 
     runner = JerichoRunner(GAME_PATH)
-    runner.agent = BayesianIFAgent(
-        sensor=sensor,
-        sensor_model=sm,
-        exploration_weight=0.3,
-    )
+    runner.agent = BayesianIFAgent(exploration_rate=0.3)
 
-    stats = runner.play_episode(max_steps=15, verbose=False)
-    assert stats["total_steps"] > 0
-    assert "sensor_stats" in stats["agent_stats"]
+    runner.play_episode(max_steps=5, verbose=False)
+
+    # After play, beliefs should have been updated from ground truth
+    assert runner.agent.beliefs.location != "unknown" or runner.agent.beliefs._location_id != 0
 
     runner.env.close()

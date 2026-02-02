@@ -3,7 +3,7 @@
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from core import GameState, DynamicsModel, BayesianActionSelector
+from core import GameState, DynamicsModel
 from metareason import (
     MetaState,
     ComputationBudget,
@@ -75,16 +75,15 @@ def test_should_keep_thinking_respects_max_iterations():
 
 
 # ---------------------------------------------------------------------------
-# deliberate
+# deliberate (v3: no selector parameter)
 # ---------------------------------------------------------------------------
 
 def test_deliberate_returns_valid_action():
     dm = DynamicsModel()
     s = _make_state(1, world_hash="room")
-    selector = BayesianActionSelector(dynamics=dm)
     budget = ComputationBudget(max_iterations=5, time_value=0.01)
 
-    action, meta = deliberate(s, dm, selector, ["look", "go"], budget)
+    action, meta = deliberate(s, dm, ["look", "go"], budget)
     assert action in ["look", "go"]
     assert meta.computation_done >= 1
 
@@ -100,11 +99,10 @@ def test_deliberate_easy_decision_fewer_steps():
         dm.update(s, "win", s_good, 10.0)
         dm.update(s, "lose", s_bad, -5.0)
 
-    selector = BayesianActionSelector(dynamics=dm)
     budget = ComputationBudget(max_iterations=50, time_value=0.01)
 
     _action_easy, meta_easy = deliberate(
-        s, dm, selector, ["win", "lose"], budget
+        s, dm, ["win", "lose"], budget
     )
 
     # Now test a hard decision (similar values)
@@ -115,10 +113,9 @@ def test_deliberate_easy_decision_fewer_steps():
         dm2.update(s, "opt_a", s_x, 1.0)
         dm2.update(s, "opt_b", s_y, 1.01)
 
-    selector2 = BayesianActionSelector(dynamics=dm2)
     budget2 = ComputationBudget(max_iterations=50, time_value=0.01)
     _action_hard, meta_hard = deliberate(
-        s, dm2, selector2, ["opt_a", "opt_b"], budget2
+        s, dm2, ["opt_a", "opt_b"], budget2
     )
 
     assert meta_easy.computation_done <= meta_hard.computation_done
@@ -128,19 +125,17 @@ def test_deliberate_budget_exhaustion():
     """With max_iterations=1, should stop after 1 iteration."""
     dm = DynamicsModel()
     s = _make_state(1, world_hash="room")
-    selector = BayesianActionSelector(dynamics=dm)
     budget = ComputationBudget(max_iterations=1, time_value=0.0)
 
-    action, meta = deliberate(s, dm, selector, ["a", "b"], budget)
+    action, meta = deliberate(s, dm, ["a", "b"], budget)
     assert meta.computation_done == 1
 
 
 def test_deliberate_empty_actions():
     dm = DynamicsModel()
     s = _make_state(1, world_hash="room")
-    selector = BayesianActionSelector(dynamics=dm)
     budget = ComputationBudget()
 
-    action, meta = deliberate(s, dm, selector, [], budget)
+    action, meta = deliberate(s, dm, [], budget)
     assert action == ""
     assert meta.computation_done == 0

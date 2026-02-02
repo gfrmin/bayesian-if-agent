@@ -1,6 +1,8 @@
 """
 LLM Sensor Model
 
+Deprecated: superseded by OracleReliability in core.py. Kept for backward compatibility.
+
 Models the reliability of the LLM sensor using Beta-distributed
 true positive and false positive rates, updated from experience.
 
@@ -111,11 +113,14 @@ class LLMSensorModel:
 
     def get_statistics(self) -> Dict:
         """Return summary statistics for logging."""
+        tp_obs = self.true_positive_alpha + self.true_positive_beta - 10
+        fp_obs = self.false_positive_alpha + self.false_positive_beta - 10
         return {
             "true_positive_rate": self.true_positive_rate,
             "false_positive_rate": self.false_positive_rate,
-            "tp_observations": self.true_positive_alpha + self.true_positive_beta - 10,
-            "fp_observations": self.false_positive_alpha + self.false_positive_beta - 10,
+            "tp_observations": tp_obs,
+            "fp_observations": fp_obs,
+            "total_updates": tp_obs + fp_obs,
         }
 
 

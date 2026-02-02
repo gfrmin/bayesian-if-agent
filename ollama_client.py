@@ -17,8 +17,8 @@ import requests
 class OllamaConfig:
     model: str = "llama3.1:8b"
     base_url: str = "http://localhost:11434"
-    temperature: float = 0.1  # Low temperature for consistency
-    timeout: int = 30
+    temperature: float = 0.2
+    timeout: int = 60
 
 
 class OllamaClient:
