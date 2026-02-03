@@ -1,11 +1,15 @@
 """
-Bayesian Interactive Fiction Agent — v4
+Bayesian Interactive Fiction Agent — v5
 
-Binary sensor bank + unified expected utility maximisation.
+Binary sensor bank + categorical suggestion sensor + unified expected utility
+maximisation.
 
 Core insight: instead of asking the LLM for rich structured analysis, ask it
-simple yes/no questions and learn each question type's reliability via
-Beta-distributed TPR/FPR.
+simple questions and learn each question type's reliability via Beta distributions.
+
+Sensor types:
+  - BinarySensor: yes/no questions with learned TPR/FPR
+  - CategoricalSensor: "which action?" with learned scalar accuracy
 
 All components are stdlib-only. LLM client is injected via duck typing
 (any object with a .complete(prompt) -> str method).
@@ -110,6 +114,66 @@ class BinarySensor:
 
 
 # =============================================================================
+# CATEGORICAL SENSOR
+# =============================================================================
+
+@dataclass
+class CategoricalSensor:
+    """
+    Categorical sensor: picks one of N options, learned scalar accuracy.
+
+    Models P(LLM picks correct action | truth) as a scalar accuracy
+    with Beta prior. When the LLM suggests action i, the posterior for
+    each action j is computed via Bayes' rule assuming uniform error
+    over wrong actions.
+    """
+
+    accuracy_alpha: float = 2.0  # Beta(2,1), mean 0.67
+    accuracy_beta: float = 1.0
+
+    query_count: int = 0
+    ground_truth_count: int = 0
+
+    @property
+    def accuracy(self) -> float:
+        """Expected accuracy (mean of Beta distribution)."""
+        return self.accuracy_alpha / (self.accuracy_alpha + self.accuracy_beta)
+
+    def update(self, suggested_correct: bool):
+        """Update accuracy from ground truth."""
+        self.ground_truth_count += 1
+        if suggested_correct:
+            self.accuracy_alpha += 1
+        else:
+            self.accuracy_beta += 1
+
+    def posteriors(self, priors: Dict[str, float], suggested: str) -> Dict[str, float]:
+        """
+        P(action_j correct | LLM suggests action_i) via Bayes' rule.
+
+        Likelihood model:
+          P(LLM suggests i | action i is correct) = accuracy
+          P(LLM suggests i | action j is correct, j != i) = (1 - accuracy) / (N - 1)
+        """
+        n = len(priors)
+        acc = self.accuracy
+        wrong_prob = (1.0 - acc) / max(n - 1, 1)
+        unnormalized = {
+            a: (acc if a == suggested else wrong_prob) * p
+            for a, p in priors.items()
+        }
+        total = sum(unnormalized.values())
+        return {a: p / total for a, p in unnormalized.items()} if total > 0 else dict(priors)
+
+    def get_stats(self) -> dict:
+        return {
+            "accuracy": self.accuracy,
+            "queries": self.query_count,
+            "ground_truths": self.ground_truth_count,
+        }
+
+
+# =============================================================================
 # QUESTION TYPES
 # =============================================================================
 
@@ -121,6 +185,8 @@ class QuestionType(Enum):
     GOAL_DONE = "goal_done"             # "Have I answered the phone?"
     PREREQ_MET = "prereq_met"           # "Can I go east?"
     ACTION_POSSIBLE = "action_possible" # "Is 'open door' available?"
+    SUGGEST_ACTION = "suggest_action"   # "Which action should I take?" (categorical)
+    MADE_PROGRESS = "made_progress"     # "Did that action make narrative progress?"
 
 
 # =============================================================================
@@ -396,6 +462,8 @@ class UnifiedDecisionMaker:
         sensor: BinarySensor,
         dynamics: 'DynamicsModel',
         state_hash: str,
+        categorical_sensor: Optional['CategoricalSensor'] = None,
+        suggestion_cost: Optional[float] = None,
     ) -> Tuple[str, Any]:
         """
         Choose between asking a question or taking a game action.
@@ -403,7 +471,7 @@ class UnifiedDecisionMaker:
         beliefs: Dict mapping action -> (alpha, beta) Beta parameters.
         Default prior for unknown actions: Beta(1/N, 1-1/N) where N = len(game_actions).
 
-        Returns: ('ask', (action, question)) or ('take', action)
+        Returns: ('ask', (action, question)) or ('take', action) or ('suggest', None)
         """
         n = len(game_actions)
         default_prior = (1.0 / n, 1.0 - 1.0 / n)
@@ -420,7 +488,7 @@ class UnifiedDecisionMaker:
 
         best_game_action = max(game_actions, key=lambda a: game_eus[a])
 
-        # Compute EU for all questions (VOI - cost)
+        # Compute EU for all binary questions (VOI - cost)
         best_question = None
         best_question_eu = float('-inf')
 
@@ -436,10 +504,22 @@ class UnifiedDecisionMaker:
                 best_question_eu = question_eu
                 best_question = (action, question)
 
+        # Compute EU for categorical suggestion (VOI - cost)
+        cat_eu = float('-inf')
+        if categorical_sensor is not None:
+            s_cost = suggestion_cost if suggestion_cost is not None else self.question_cost
+            cat_voi = self.compute_voi_categorical(game_actions, beliefs, categorical_sensor)
+            cat_eu = cat_voi - s_cost
+
+        # Pick best among: take, ask (binary), suggest (categorical)
+        candidates = [('take', best_game_action, game_eus[best_game_action])]
         if best_question is not None and best_question_eu > 0:
-            return ('ask', best_question)
-        else:
-            return ('take', best_game_action)
+            candidates.append(('ask', best_question, game_eus[best_game_action] + best_question_eu))
+        if cat_eu > 0:
+            candidates.append(('suggest', None, game_eus[best_game_action] + cat_eu))
+
+        best = max(candidates, key=lambda c: c[2])
+        return (best[0], best[1])
 
     def compute_voi(
         self,
@@ -490,6 +570,43 @@ class UnifiedDecisionMaker:
 
         return max(0.0, voi)
 
+    def compute_voi_categorical(
+        self,
+        actions: List[str],
+        beliefs: Dict[str, Tuple[float, float]],
+        sensor: 'CategoricalSensor',
+    ) -> float:
+        """
+        VOI for 'what should I do?' — one question updates all N beliefs.
+
+        For each possible suggestion, compute: P(LLM suggests it) and the
+        posterior belief over all actions. Then compute expected best EU
+        after observing the suggestion.
+        """
+        n = len(actions)
+        acc = sensor.accuracy
+        wrong_prob = (1.0 - acc) / max(n - 1, 1)
+        default_prior = (1.0 / n, 1.0 - 1.0 / n)
+
+        priors = {
+            a: beliefs.get(a, default_prior)[0] / sum(beliefs.get(a, default_prior))
+            for a in actions
+        }
+        current_best_eu = max(p - self.action_cost for p in priors.values())
+
+        expected_best_after = 0.0
+        for suggested in actions:
+            # P(LLM suggests this action) = sum over true actions of P(suggest|true)*P(true)
+            p_suggests = sum(
+                (acc if a == suggested else wrong_prob) * priors[a]
+                for a in actions
+            )
+            post = sensor.posteriors(priors, suggested)
+            best_eu_after = max(post[a] - self.action_cost for a in actions)
+            expected_best_after += p_suggests * best_eu_after
+
+        return max(0.0, expected_best_after - current_best_eu)
+
 
 # =============================================================================
 # TESTING
@@ -520,8 +637,10 @@ if __name__ == "__main__":
     print(f"Posterior(0.5, yes)={posterior:.3f}, Posterior(0.5, no)={posterior_no:.3f}")
 
     # Test 2: QuestionType
-    assert len(QuestionType) == 7
+    assert len(QuestionType) == 9
     assert QuestionType.ACTION_HELPS.value == "action_helps"
+    assert QuestionType.SUGGEST_ACTION.value == "suggest_action"
+    assert QuestionType.MADE_PROGRESS.value == "made_progress"
     print(f"\nQuestionTypes: {[qt.value for qt in QuestionType]}")
 
     # Test 3: LLMSensorBank with mock (all sensors use spec defaults)
@@ -637,4 +756,56 @@ if __name__ == "__main__":
     assert voi >= 0
     print(f"VOI: {voi:.4f}")
 
-    print("\nAll core v6 tests passed!")
+    # Test 8: CategoricalSensor
+    cat = CategoricalSensor()
+    assert abs(cat.accuracy - 2/3) < 0.01
+    assert cat.query_count == 0
+    assert cat.ground_truth_count == 0
+    print(f"\nCategoricalSensor: accuracy={cat.accuracy:.2f}")
+
+    # Posteriors sum to 1
+    priors = {"a": 0.25, "b": 0.25, "c": 0.25, "d": 0.25}
+    post = cat.posteriors(priors, "a")
+    assert abs(sum(post.values()) - 1.0) < 1e-9
+    print(f"Posteriors sum: {sum(post.values()):.6f}")
+
+    # Suggested action gets boosted
+    assert post["a"] > priors["a"]
+    # Non-suggested actions drop
+    assert post["b"] < priors["b"]
+    assert post["c"] < priors["c"]
+    print(f"Posterior(a)={post['a']:.3f} > prior={priors['a']:.3f}")
+
+    # Accuracy updates from ground truth
+    cat.update(suggested_correct=True)
+    assert cat.accuracy > 2/3
+    cat.update(suggested_correct=False)
+    cat.update(suggested_correct=False)
+    # After 1 correct, 2 incorrect from prior Beta(2,1): Beta(3,3), mean 0.5
+    assert abs(cat.accuracy - 0.5) < 0.01
+    assert cat.ground_truth_count == 3
+    print(f"After 3 updates: accuracy={cat.accuracy:.2f}")
+
+    # get_stats
+    stats = cat.get_stats()
+    assert "accuracy" in stats
+    assert "queries" in stats
+    assert "ground_truths" in stats
+    print(f"CategoricalSensor stats: {stats}")
+
+    # Test 9: VOI categorical
+    dm2 = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
+    cat2 = CategoricalSensor(accuracy_alpha=8, accuracy_beta=2)  # accuracy 0.8
+    voi_cat = dm2.compute_voi_categorical(
+        ["a1", "a2", "a3"],
+        {"a1": (0.33, 0.67), "a2": (0.33, 0.67), "a3": (0.33, 0.67)},
+        cat2,
+    )
+    assert voi_cat >= 0
+    print(f"\nVOI categorical: {voi_cat:.4f}")
+
+    # VOI should be > 0 with weak uniform priors
+    assert voi_cat > 0
+    print("VOI categorical > 0 with weak priors: OK")
+
+    print("\nAll core v5 tests passed!")

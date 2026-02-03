@@ -583,3 +583,103 @@ If agent behaves badly:
 3. **Sensor reliability learned** from outcomes
 4. **No loops** — if cycling, agent asks LLM and learns those actions don't help
 5. **All behavior explainable** via EU maximisation
+
+---
+
+## Categorical Suggestion Sensor
+
+### Motivation
+
+The binary "will action X help?" question has two problems:
+1. One question per action → N questions to assess N actions
+2. TPR ≈ 0 in practice — LLMs say YES to everything
+
+A categorical question — "which action should I take?" — addresses both. One question informs beliefs about all N actions simultaneously.
+
+### Model
+
+**Question:** Present numbered action list, ask LLM to pick one.
+
+**Accuracy:** Scalar $a \sim \text{Beta}(\alpha, \beta)$, prior Beta(2, 1) (mean 0.67).
+
+**Likelihood:**
+$$P(\text{LLM suggests } i \mid \text{action } j \text{ is correct}) = \begin{cases} a & \text{if } i = j \\ \frac{1-a}{N-1} & \text{if } i \neq j \end{cases}$$
+
+**Posterior via Bayes' rule:**
+$$P(\text{action } j \text{ correct} \mid \text{LLM suggests } i) = \frac{P(\text{suggests } i \mid j) \cdot P(j)}{\sum_k P(\text{suggests } i \mid k) \cdot P(k)}$$
+
+**Moment-matching:** The categorical posterior is converted back to Beta parameters for each action by preserving total count (incremented by 1) and setting the mean to the posterior.
+
+### VOI for Categorical Suggestion
+
+$$\text{VOI}_{\text{cat}} = \sum_{i} P(\text{suggests } i) \cdot \max_j \left[ P(j \mid \text{suggests } i) - c_{\text{act}} \right] - \max_j \left[ P(j) - c_{\text{act}} \right]$$
+
+Where $P(\text{suggests } i) = \sum_j P(\text{suggests } i \mid j) \cdot P(j)$.
+
+This competes with binary VOI in the unified decision framework. In practice, categorical dominates because one question updates all N actions.
+
+### Ground Truth
+
+- **Reward > 0** after taking suggested action → correct
+- **Reward > 0** after taking different action → incorrect
+- **Reward == 0** → consult progress sensor (see below)
+
+---
+
+## Progress Evaluator
+
+### Role
+
+Supplementary ground truth for the suggestion sensor between reward events. Not a primary sensor — it doesn't directly influence action selection.
+
+### Model
+
+Binary sensor with learned TPR/FPR (same structure as BinarySensor).
+
+**Question:** Compare before/after observation text — "Did the player make narrative progress?"
+
+### Ground Truth for Itself
+
+When game reward > 0, we have certain ground truth. Query the progress sensor and update:
+- Progress said YES + reward > 0 → true positive (tp_alpha += 1)
+- Progress said NO + reward > 0 → false negative (tp_beta += 1)
+
+Sparse but certain calibration.
+
+---
+
+## Ground Truth Hierarchy
+
+```
+1. Game reward > 0 (certain, frequent in benchmark games)
+   → Primary ground truth for ALL sensors
+   → Binary sensor: update TPR/FPR
+   → Categorical sensor: suggested == taken action? → correct/incorrect
+   → Progress sensor: calibrate TPR/FPR
+
+2. Progress sensor (noisy, available every turn)
+   → Supplementary ground truth for categorical sensor
+   → Only used when reward == 0 and suggestion was tracked
+```
+
+**Key rule:** Episode-level failure (total score = 0) says nothing about individual actions. Each action is evaluated independently by reward (when available) or progress sensor (otherwise).
+
+---
+
+## Benchmark Games
+
+GLoW paper benchmark games with frequent rewards (unlike 9:05 which has only 1 reward at the end).
+
+| Category | Game | Max Score | WT Steps | Reward Events | 1st Reward |
+|----------|------|-----------|----------|---------------|------------|
+| Possible | pentari | 70 | 49 | 8 | step 4 |
+| Possible | detective | 360 | 51 | 26 | step 1 |
+| Possible | temple | 35 | 181 | 9 | step 10 |
+| Possible | ztuu | 100 | 84 | 18 | step 7 |
+| Difficult | zork1 | 350 | 396 | 43 | step 4 |
+| Difficult | zork3 | 7 | 273 | 7 | step 23 |
+| Difficult | deephome | 300 | 327 | 56 | step 3 |
+| Difficult | ludicorp | 150 | 364 | 92 | step 2 |
+| Extreme | enchanter | 400 | 265 | 18 | step 24 |
+
+With frequent rewards, the existing `reward > 0` ground truth fires regularly, making sensor learning viable without depending solely on the progress evaluator.

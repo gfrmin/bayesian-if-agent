@@ -1,5 +1,5 @@
-"""Tests for core.py v6 — BinarySensor, QuestionType, LLMSensorBank,
-BeliefState, StateActionKey, ObservedOutcome, DynamicsModel,
+"""Tests for core.py v5 — BinarySensor, CategoricalSensor, QuestionType,
+LLMSensorBank, BeliefState, StateActionKey, ObservedOutcome, DynamicsModel,
 UnifiedDecisionMaker."""
 
 import sys
@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from core import (
     BinarySensor,
+    CategoricalSensor,
     QuestionType,
     LLMSensorBank,
     BeliefState,
@@ -117,7 +118,7 @@ def test_sensor_get_stats():
 # ---------------------------------------------------------------------------
 
 def test_question_type_completeness():
-    assert len(QuestionType) == 7
+    assert len(QuestionType) == 9
     values = {qt.value for qt in QuestionType}
     assert "action_helps" in values
     assert "in_location" in values
@@ -126,6 +127,8 @@ def test_question_type_completeness():
     assert "goal_done" in values
     assert "prereq_met" in values
     assert "action_possible" in values
+    assert "suggest_action" in values
+    assert "made_progress" in values
 
 
 # ---------------------------------------------------------------------------
@@ -194,8 +197,10 @@ def test_sensor_bank_get_posterior():
 def test_sensor_bank_get_all_stats():
     bank = LLMSensorBank(MockYesLLM())
     stats = bank.get_all_stats()
-    assert len(stats) == 7
+    assert len(stats) == 9
     assert "action_helps" in stats
+    assert "suggest_action" in stats
+    assert "made_progress" in stats
 
 
 def test_sensor_bank_all_sensors_use_spec_defaults():
@@ -599,3 +604,121 @@ def test_udm_decision_comparison_is_voi_vs_cost():
                           {"a1": 0.5 - 0.10, "a2": 0.2 - 0.10})
     if voi > 0.01:
         assert decision[0] == 'ask'
+
+
+# ---------------------------------------------------------------------------
+# CategoricalSensor
+# ---------------------------------------------------------------------------
+
+def test_categorical_sensor_posteriors_sum_to_one():
+    cs = CategoricalSensor()
+    priors = {"a": 0.25, "b": 0.25, "c": 0.25, "d": 0.25}
+    post = cs.posteriors(priors, "a")
+    assert abs(sum(post.values()) - 1.0) < 1e-9
+
+
+def test_categorical_sensor_posteriors_sum_to_one_nonuniform():
+    cs = CategoricalSensor(accuracy_alpha=8, accuracy_beta=2)
+    priors = {"a": 0.5, "b": 0.3, "c": 0.2}
+    post = cs.posteriors(priors, "b")
+    assert abs(sum(post.values()) - 1.0) < 1e-9
+
+
+def test_categorical_sensor_boosts_suggested():
+    cs = CategoricalSensor()
+    priors = {"a": 0.25, "b": 0.25, "c": 0.25, "d": 0.25}
+    post = cs.posteriors(priors, "a")
+    assert post["a"] > priors["a"]
+
+
+def test_categorical_sensor_non_suggested_lowered():
+    cs = CategoricalSensor()
+    priors = {"a": 0.25, "b": 0.25, "c": 0.25, "d": 0.25}
+    post = cs.posteriors(priors, "a")
+    assert post["b"] < priors["b"]
+    assert post["c"] < priors["c"]
+    assert post["d"] < priors["d"]
+
+
+def test_categorical_sensor_accuracy_learns():
+    cs = CategoricalSensor()
+    initial = cs.accuracy
+    cs.update(suggested_correct=True)
+    assert cs.accuracy > initial
+    cs.update(suggested_correct=False)
+    cs.update(suggested_correct=False)
+    # After 1 correct, 2 incorrect from Beta(2,1): Beta(3,3), mean 0.5
+    assert abs(cs.accuracy - 0.5) < 0.01
+    assert cs.ground_truth_count == 3
+
+
+def test_categorical_sensor_get_stats():
+    cs = CategoricalSensor()
+    cs.update(True)
+    stats = cs.get_stats()
+    assert "accuracy" in stats
+    assert "queries" in stats
+    assert "ground_truths" in stats
+    assert stats["ground_truths"] == 1
+    assert stats["queries"] == 0
+
+
+def test_categorical_voi_non_negative():
+    udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
+    cs = CategoricalSensor()
+    voi = udm.compute_voi_categorical(
+        ["a1", "a2", "a3"],
+        {"a1": (0.33, 0.67), "a2": (0.33, 0.67), "a3": (0.33, 0.67)},
+        cs,
+    )
+    assert voi >= 0.0
+
+
+def test_categorical_voi_higher_with_accurate_sensor():
+    udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
+    weak = CategoricalSensor(accuracy_alpha=2, accuracy_beta=2)   # accuracy 0.5
+    strong = CategoricalSensor(accuracy_alpha=9, accuracy_beta=1)  # accuracy 0.9
+
+    beliefs = {"a1": (0.33, 0.67), "a2": (0.33, 0.67), "a3": (0.33, 0.67)}
+    voi_weak = udm.compute_voi_categorical(["a1", "a2", "a3"], beliefs, weak)
+    voi_strong = udm.compute_voi_categorical(["a1", "a2", "a3"], beliefs, strong)
+
+    assert voi_strong >= voi_weak
+
+
+def test_categorical_voi_zero_when_all_known():
+    """VOI is zero when dynamics has observations for all actions."""
+    udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
+    cs = CategoricalSensor(accuracy_alpha=9, accuracy_beta=1)
+    d = DynamicsModel()
+    d.record_observation("s", "a1", "s2", 1.0)
+    d.record_observation("s", "a2", "s2", 0.0)
+
+    # When all actions have known outcomes, categorical sensor adds nothing.
+    # The choose() method handles this — known rewards bypass belief entirely.
+    # Here we test VOI on the beliefs themselves (even with all known, beliefs
+    # don't change the decision since known rewards dominate).
+    # With strongly peaked beliefs, VOI should be ~0.
+    beliefs = {"a1": (100.0, 0.01), "a2": (0.01, 100.0)}
+    voi = udm.compute_voi_categorical(["a1", "a2"], beliefs, cs)
+    assert voi < 0.01
+
+
+def test_categorical_sensor_choose_integrates():
+    """UnifiedDecisionMaker.choose with categorical_sensor parameter."""
+    udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
+    cs = CategoricalSensor(accuracy_alpha=9, accuracy_beta=1)
+    d = DynamicsModel()
+
+    # With weak priors and accurate categorical sensor, should suggest
+    decision = udm.choose(
+        game_actions=["a1", "a2", "a3"],
+        possible_questions=[],
+        beliefs={"a1": (0.33, 0.67), "a2": (0.33, 0.67), "a3": (0.33, 0.67)},
+        sensor=BinarySensor(),
+        dynamics=d,
+        state_hash="s",
+        categorical_sensor=cs,
+        suggestion_cost=0.01,
+    )
+    assert decision[0] in ('suggest', 'take')

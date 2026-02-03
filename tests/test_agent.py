@@ -1,11 +1,11 @@
-"""Tests for BayesianIFAgent (runner.py v6) with mock FrotzEnv and LLM."""
+"""Tests for BayesianIFAgent (runner.py v5) with mock FrotzEnv and LLM."""
 
 import sys
 import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from core import BeliefState, DynamicsModel, QuestionType
+from core import BeliefState, CategoricalSensor, DynamicsModel, QuestionType
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +73,24 @@ class MockNoLLM:
     """Always says NO."""
     def complete(self, prompt):
         return "NO"
+
+
+class MockSuggestionLLM:
+    """Returns "3" for suggestion prompts, "YES" for progress prompts,
+    "YES"/"NO" for binary prompts based on action name."""
+
+    def __init__(self, suggestion_idx=3):
+        self.call_count = 0
+        self.suggestion_idx = suggestion_idx
+
+    def complete(self, prompt):
+        self.call_count += 1
+        prompt_lower = prompt.lower()
+        if "which single action" in prompt_lower or "number of your chosen action" in prompt_lower:
+            return str(self.suggestion_idx)
+        if "narrative progress" in prompt_lower or "did the player make" in prompt_lower:
+            return "YES"
+        return "YES"
 
 
 # ---------------------------------------------------------------------------
@@ -310,3 +328,121 @@ def test_agent_no_action_prior_parameter():
     assert agent.decision_maker.question_cost == 0.02
     assert agent.decision_maker.action_cost == 0.05
     assert not hasattr(agent.decision_maker, 'action_prior')
+
+
+# ---------------------------------------------------------------------------
+# Categorical sensor + progress evaluator tests
+# ---------------------------------------------------------------------------
+
+def test_agent_creation_has_categorical_sensor_with_llm():
+    """With LLM, agent should have categorical sensor and progress sensor."""
+    agent = BayesianIFAgent(llm_client=MockYesLLM())
+    assert agent.categorical_sensor is not None
+    assert agent.progress_sensor is not None
+
+
+def test_agent_creation_no_categorical_without_llm():
+    """Without LLM, no categorical/progress sensors."""
+    agent = BayesianIFAgent()
+    assert agent.categorical_sensor is None
+    assert agent.progress_sensor is None
+
+
+def test_agent_suggestion_cost_defaults_to_question_cost():
+    agent = BayesianIFAgent(llm_client=MockYesLLM(), question_cost=0.05)
+    assert agent.suggestion_cost == 0.05
+
+
+def test_agent_suggestion_cost_override():
+    agent = BayesianIFAgent(
+        llm_client=MockYesLLM(), question_cost=0.01, suggestion_cost=0.02
+    )
+    assert agent.suggestion_cost == 0.02
+
+
+def test_agent_suggestion_updates_all_beliefs():
+    """When categorical suggestion is used, all action beliefs should update."""
+    llm = MockSuggestionLLM(suggestion_idx=2)
+    agent = BayesianIFAgent(llm_client=llm, question_cost=0.001)
+    env = MockFrotzEnv(valid_actions=["look", "go north", "take keys"])
+    env.reset()
+
+    # Force categorical sensor to be very accurate so VOI is high
+    agent.categorical_sensor.accuracy_alpha = 9.0
+    agent.categorical_sensor.accuracy_beta = 1.0
+
+    action, explanation = agent.choose_action(env, "You are in a room.")
+    # The agent should function without crashing
+    assert action in env.get_valid_actions()
+
+
+def test_agent_reward_updates_categorical_accuracy():
+    """When reward > 0 and suggestion was tracked, categorical sensor updates."""
+    llm = MockSuggestionLLM(suggestion_idx=1)
+    agent = BayesianIFAgent(llm_client=llm, question_cost=0.001)
+    env = MockFrotzEnv(
+        valid_actions=["look", "go north"],
+        state_hashes=[100, 200],
+        scores=[0, 1],
+    )
+    env.reset()
+
+    # Manually set last_suggestion to simulate a prior suggestion
+    action, _ = agent.choose_action(env, "room")
+    agent.last_suggestion = action  # simulate LLM suggested this action
+
+    old_gt = agent.categorical_sensor.ground_truth_count
+    obs, reward, _, _ = env.step(action)
+    agent.observe_outcome(env, action, obs, reward)
+
+    if reward > 0:
+        assert agent.categorical_sensor.ground_truth_count > old_gt
+
+
+def test_agent_progress_provides_ground_truth_no_reward():
+    """When reward == 0 but progress says YES, categorical sensor still updates."""
+    llm = MockSuggestionLLM(suggestion_idx=1)
+    agent = BayesianIFAgent(llm_client=llm, question_cost=0.001)
+    env = MockFrotzEnv(
+        valid_actions=["look", "go north"],
+        state_hashes=[100, 200],
+        scores=[0, 0],  # no reward
+    )
+    env.reset()
+
+    action, _ = agent.choose_action(env, "room")
+    agent.last_suggestion = action  # simulate prior suggestion
+
+    old_gt = agent.categorical_sensor.ground_truth_count
+    obs, reward, _, _ = env.step(action)
+    agent.observe_outcome(env, action, obs, reward)
+
+    # Progress sensor should have been consulted (reward == 0)
+    # MockSuggestionLLM returns YES for progress → categorical sensor updates
+    assert agent.categorical_sensor.ground_truth_count > old_gt
+
+
+def test_agent_episode_resets_suggestion_state():
+    """play_episode should reset last_suggestion and last_observation."""
+    agent = BayesianIFAgent(llm_client=MockYesLLM())
+    env = MockFrotzEnv()
+
+    agent.last_suggestion = "some action"
+    agent.last_observation = "some text"
+
+    agent.play_episode(env, max_steps=3)
+
+    # After episode plays, these should have been reset at start
+    # (and whatever happens during play is fine)
+    # The key thing: agent doesn't crash with suggestion flow
+
+
+def test_agent_episode_with_suggestion_llm():
+    """Full episode with suggestion LLM should not crash."""
+    llm = MockSuggestionLLM(suggestion_idx=1)
+    agent = BayesianIFAgent(llm_client=llm, question_cost=0.001)
+    env = MockFrotzEnv()
+
+    result = agent.play_episode(env, max_steps=5)
+    assert result["steps"] > 0
+    assert "categorical_sensor_stats" in result

@@ -14,8 +14,8 @@ Bayesian agent for Interactive Fiction — all decisions via expected utility ma
 ## Key Files
 
 - `SPEC.md` — Full specification with math derivations and pseudocode
-- `core.py` — Core components (stdlib-only): BinarySensor, LLMSensorBank, BeliefState, DynamicsModel, UnifiedDecisionMaker
-- `runner.py` — BayesianIFAgent orchestrator + CLI (imports Jericho)
+- `core.py` — Core components (stdlib-only): BinarySensor, CategoricalSensor, LLMSensorBank, BeliefState, DynamicsModel, UnifiedDecisionMaker
+- `runner.py` — BayesianIFAgent orchestrator + CLI + benchmark (imports Jericho)
 - `ollama_client.py` — HTTP interface to local Ollama
 - `setup_check.py` — Dependency verification + quick 3-action demo
 - `tests/` — test_core.py, test_agent.py, test_integration.py
@@ -24,13 +24,14 @@ Bayesian agent for Interactive Fiction — all decisions via expected utility ma
 
 Flat file layout. `core.py` is stdlib-only. LLM client injected via duck typing.
 
-**Pipeline:** Game observation → LLM sensor bank (binary yes/no questions) → BeliefState → UnifiedDecisionMaker (EU maximisation) → Action
+**Pipeline:** Game observation → LLM sensor bank (binary + categorical questions) → BeliefState → UnifiedDecisionMaker (EU maximisation) → Action
 
 - **BinarySensor** — Beta-distributed TPR/FPR, learns from ground truth, computes posterior via Bayes' rule
+- **CategoricalSensor** — "Which action?" with scalar accuracy ~ Beta, updates all action beliefs at once
 - **LLMSensorBank** — Per-question-type sensors + LLM queries, per-turn cache
 - **BeliefState** — Probability dicts for location, inventory, flags, goals, actions
 - **DynamicsModel** — Deterministic: one observation = certainty
-- **UnifiedDecisionMaker** — VOI-based ask-or-act in unified EU framework
+- **UnifiedDecisionMaker** — VOI-based ask-or-act-or-suggest in unified EU framework
 
 ## Commands
 
@@ -39,10 +40,14 @@ uv sync                         # install deps
 uv run python setup_check.py    # verify deps + quick 3-action demo
 uv run python core.py            # unit tests for core components
 uv run pytest tests/             # full test suite
-uv run python runner.py          # full 10-episode learning run
+uv run python runner.py          # full 10-episode learning run (default: 905.z5)
 uv run python runner.py --episodes 3 --verbose  # verbose learning run
 uv run python runner.py --question-cost 0.05     # adjust LLM query cost
 uv run python runner.py --action-cost 0.15       # increase cost of taking actions
+uv run python runner.py --game zork1 --episodes 5 --verbose  # play specific game
+uv run python runner.py --game detective --episodes 3         # most frequent rewards
+uv run python runner.py --benchmark --episodes 3              # full GLoW benchmark
+uv run python runner.py --suggestion-cost 0.02                # adjust categorical query cost
 ```
 
 Game files go in `games/`. Download 9:05: `curl -L "https://www.ifarchive.org/if-archive/games/zcode/905.z5" -o games/905.z5`
