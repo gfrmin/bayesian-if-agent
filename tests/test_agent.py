@@ -326,7 +326,8 @@ def test_agent_no_action_prior_parameter():
     # Just verify it works without action_prior
     agent = BayesianIFAgent(question_cost=0.02, action_cost=0.05)
     assert agent.decision_maker.question_cost == 0.02
-    assert agent.decision_maker.action_cost == 0.05
+    # action_cost now lives on DynamicsModel, not UnifiedDecisionMaker
+    assert agent.dynamics.action_cost == 0.05
     assert not hasattr(agent.decision_maker, 'action_prior')
 
 

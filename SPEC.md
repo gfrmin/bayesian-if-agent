@@ -425,7 +425,7 @@ $$V(s_{\text{unknown}}) = 0.5 \quad \text{(Beta(1,1) max-entropy prior)}$$
 | Parameter | Value | Justification |
 |-----------|-------|---------------|
 | γ | 0.95 | Finite horizon: γ^100 ≈ 0.006, so rewards >60 steps away are negligible. Prevents divergence in cycles (go east / go west). Standard for finite-horizon MDPs. |
-| c_act | 0.10 | Same as UnifiedDecisionMaker — opportunity cost per turn. |
+| c_act | 0.10 | Opportunity cost per turn. DynamicsModel owns this; UnifiedDecisionMaker delegates via q_value()/untried_q_value(). |
 | V_unknown | 0.5 | Beta(1,1) maximum-entropy prior for unvisited states. |
 | 1/N | structural | Mean of Beta(1/N, 1−1/N) — one untried action helps, don't know which. |
 
@@ -439,11 +439,14 @@ The previous `V(s) = beta_mean × untried_frac` collapses to ~0 when most action
 
 ```python
 class UnifiedDecisionMaker:
-    """Choose between asking and acting via EU maximisation."""
+    """Choose between asking and acting via EU maximisation.
 
-    def __init__(self, question_cost: float, action_cost: float):
+    Q-value computation is delegated to DynamicsModel (single source of truth
+    for R(s,a) + γ·V(s') - c_act). This class only owns question_cost.
+    """
+
+    def __init__(self, question_cost: float):
         self.question_cost = question_cost
-        self.action_cost = action_cost
 
     def choose(
         self,
@@ -454,40 +457,39 @@ class UnifiedDecisionMaker:
         dynamics: DynamicsModel,
     ) -> Tuple[str, Any]:  # ('ask', action) or ('take', action)
 
-        # Compute EU for each game action
+        # Compute EU for each game action — delegated to dynamics
         game_eus = {}
         n = len(actions)
         for a in actions:
-            known = dynamics.known_reward(state, a)
-            if known is not None:
-                game_eus[a] = known - self.action_cost
+            q = dynamics.q_value(state, a)
+            if q is not None:
+                game_eus[a] = q  # R(s,a) + γ·V(s') - c_act
             else:
                 alpha, beta = beliefs.get(a, (1.0/n, 1.0 - 1.0/n))
-                game_eus[a] = alpha / (alpha + beta) - self.action_cost
-        
-        best_game_eu = max(game_eus.values())
+                game_eus[a] = dynamics.untried_q_value(alpha / (alpha + beta))
+
         best_game_action = max(actions, key=lambda a: game_eus[a])
-        
+
         # Find best question (highest VOI)
         best_voi = 0.0
         best_question_action = None
-        
+
         for a in actions:
-            if dynamics.is_known(state, a):
+            if dynamics.has_observation(state, a):
                 continue  # No point asking about known outcomes
 
             alpha, beta = beliefs.get(a, (1.0/n, 1.0 - 1.0/n))
-            voi = self.compute_voi(a, alpha, beta, sensor, game_eus)
+            voi = self.compute_voi(a, alpha, beta, sensor, game_eus, dynamics)
             if voi > best_voi:
                 best_voi = voi
                 best_question_action = a
-        
+
         # Decision: ask if VOI > cost
         if best_question_action is not None and best_voi > self.question_cost:
             return ('ask', best_question_action)
         else:
             return ('take', best_game_action)
-    
+
     def compute_voi(
         self,
         action: str,
@@ -495,6 +497,7 @@ class UnifiedDecisionMaker:
         beta: float,
         sensor: BinarySensor,
         game_eus: Dict[str, float],
+        dynamics: DynamicsModel,
     ) -> float:
         """Value of information for asking about action.
 
@@ -513,9 +516,9 @@ class UnifiedDecisionMaker:
         post_yes = sensor.posterior(belief, True)
         post_no = sensor.posterior(belief, False)
 
-        # EU of this action under each posterior (minus action_cost)
-        eu_yes = post_yes - self.action_cost
-        eu_no = post_no - self.action_cost
+        # EU of this action under each posterior — via dynamics (single source)
+        eu_yes = dynamics.untried_q_value(post_yes)
+        eu_no = dynamics.untried_q_value(post_no)
 
         # Best EU after each answer (other actions unchanged)
         other_best = max((eu for a, eu in game_eus.items() if a != action), default=0)

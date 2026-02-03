@@ -412,6 +412,70 @@ def test_dynamics_stats():
 
 
 # ---------------------------------------------------------------------------
+# DynamicsModel.q_value and untried_q_value
+# ---------------------------------------------------------------------------
+
+def test_q_value_matches_value_iteration():
+    """dynamics.q_value() must equal the Q used internally by value iteration."""
+    d = DynamicsModel(action_cost=0.10, gamma=0.95)
+    d.register_state("s", 2)
+    d.register_state("s2", 3)
+    d.record_observation("s", "a1", "s2", 5.0)
+    d.record_observation("s", "a2", "s", 0.0)
+
+    # Force value iteration
+    v_s2 = d.state_value("s2")
+    q = d.q_value("s", "a1")
+    assert q is not None
+    expected = 5.0 + 0.95 * v_s2 - 0.10
+    assert abs(q - expected) < 1e-9
+
+
+def test_q_value_returns_none_for_unobserved():
+    """q_value returns None for actions not yet observed."""
+    d = DynamicsModel()
+    assert d.q_value("s", "a") is None
+
+
+def test_untried_q_value_uses_gamma():
+    """untried_q_value includes γ·V₀, not bare V₀."""
+    d = DynamicsModel(action_cost=0.10, gamma=0.95)
+    q = d.untried_q_value(0.5)
+    # 0.5 + 0.95·0.5 - 0.10 = 0.875
+    assert abs(q - 0.875) < 1e-9
+
+    # Verify γ matters: with γ=1.0 the result would be different
+    d2 = DynamicsModel(action_cost=0.10, gamma=1.0)
+    q2 = d2.untried_q_value(0.5)
+    # 0.5 + 1.0·0.5 - 0.10 = 0.90
+    assert abs(q2 - 0.90) < 1e-9
+    assert q2 > q  # γ=1.0 gives higher Q than γ=0.95
+
+
+def test_q_value_consistent_with_choose():
+    """choose() EU for tried actions should equal dynamics.q_value()."""
+    d = DynamicsModel(action_cost=0.10, gamma=0.95)
+    d.register_state("s", 2)
+    d.register_state("s2", 1)
+    d.record_observation("s", "a1", "s2", 5.0)
+    d.record_observation("s", "a2", "s", 0.0)
+
+    udm = UnifiedDecisionMaker(question_cost=0.01)
+    # Run choose to verify it picks the right action
+    decision = udm.choose(
+        game_actions=["a1", "a2"],
+        possible_questions=[],
+        beliefs={"a1": (0.5, 0.5), "a2": (0.5, 0.5)},
+        sensor=BinarySensor(),
+        dynamics=d,
+        state_hash="s",
+    )
+    assert decision == ('take', 'a1')
+    # q_value for a1 should be > q_value for a2
+    assert d.q_value("s", "a1") > d.q_value("s", "a2")
+
+
+# ---------------------------------------------------------------------------
 # UnifiedDecisionMaker (beliefs are now Beta tuples)
 # ---------------------------------------------------------------------------
 
@@ -474,33 +538,36 @@ def test_udm_no_questions_when_all_observed():
 def test_udm_voi_non_negative():
     """VOI should never be negative."""
     udm = UnifiedDecisionMaker()
+    d = DynamicsModel()
     sensor = BinarySensor()
-    # EUs consistent with untried formula: belief_mean + V₀ - action_cost
-    eus = {"a1": 0.5 + 0.5 - 0.10, "a2": 0.5 + 0.5 - 0.10}
-    voi = udm.compute_voi("a1", 0.5, 0.5, sensor, eus)
+    # EUs consistent with untried formula: belief_mean + γ·V₀ - action_cost
+    eus = {"a1": d.untried_q_value(0.5), "a2": d.untried_q_value(0.5)}
+    voi = udm.compute_voi("a1", 0.5, 0.5, sensor, eus, d)
     assert voi >= 0.0
 
 
 def test_udm_voi_zero_when_certain():
     """VOI is zero when belief is already certain."""
     udm = UnifiedDecisionMaker()
+    d = DynamicsModel()
     sensor = BinarySensor()
-    # Alpha >> beta means ~certain it helps; EU includes V₀
-    eus = {"a1": 100/100.01 + 0.5 - 0.10, "a2": 0.5 + 0.5 - 0.10}
-    voi = udm.compute_voi("a1", 100.0, 0.01, sensor, eus)
+    # Alpha >> beta means ~certain it helps
+    eus = {"a1": d.untried_q_value(100/100.01), "a2": d.untried_q_value(0.5)}
+    voi = udm.compute_voi("a1", 100.0, 0.01, sensor, eus, d)
     assert abs(voi) < 0.01
 
 
 def test_udm_voi_higher_with_reliable_sensor():
     """More reliable sensor should have higher VOI (more informative)."""
     udm = UnifiedDecisionMaker()
+    d = DynamicsModel()
 
     unreliable = BinarySensor(tp_alpha=5, tp_beta=5, fp_alpha=5, fp_beta=5)
     reliable = BinarySensor(tp_alpha=9, tp_beta=1, fp_alpha=1, fp_beta=9)
 
-    eus = {"a1": 0.5 + 0.5 - 0.10, "a2": 0.5 + 0.5 - 0.10}
-    voi_unreliable = udm.compute_voi("a1", 0.5, 0.5, unreliable, eus)
-    voi_reliable = udm.compute_voi("a1", 0.5, 0.5, reliable, eus)
+    eus = {"a1": d.untried_q_value(0.5), "a2": d.untried_q_value(0.5)}
+    voi_unreliable = udm.compute_voi("a1", 0.5, 0.5, unreliable, eus, d)
+    voi_reliable = udm.compute_voi("a1", 0.5, 0.5, reliable, eus, d)
 
     assert voi_reliable >= voi_unreliable
 
@@ -508,24 +575,24 @@ def test_udm_voi_higher_with_reliable_sensor():
 def test_udm_voi_positive_for_non_best():
     """VOI should be positive when asking about a non-best uncertain action."""
     udm = UnifiedDecisionMaker()
+    d = DynamicsModel()
     sensor = BinarySensor(tp_alpha=9, tp_beta=1, fp_alpha=1, fp_beta=9)
 
     # a1 has lower EU than a2 — asking about a1 could reveal it's better
-    # EUs include V₀: belief_mean + V₀ - action_cost
-    eus = {"a1": 0.3 + 0.5 - 0.10, "a2": 0.7 + 0.5 - 0.10}
-    voi = udm.compute_voi("a1", 0.3, 0.7, sensor, eus)
+    eus = {"a1": d.untried_q_value(0.3), "a2": d.untried_q_value(0.7)}
+    voi = udm.compute_voi("a1", 0.3, 0.7, sensor, eus, d)
     assert voi > 0.0
 
 
 def test_udm_voi_zero_for_best_action():
     """VOI is ~0 when asking about the action that's already the best."""
     udm = UnifiedDecisionMaker()
+    d = DynamicsModel()
     sensor = BinarySensor(tp_alpha=9, tp_beta=1, fp_alpha=1, fp_beta=9)
 
     # a1 is already the best — asking about it can't improve decisions
-    # EUs include V₀: belief_mean + V₀ - action_cost
-    eus = {"a1": 0.8 + 0.5 - 0.10, "a2": 0.1 + 0.5 - 0.10}
-    voi = udm.compute_voi("a1", 8.0, 2.0, sensor, eus)
+    eus = {"a1": d.untried_q_value(0.8), "a2": d.untried_q_value(0.1)}
+    voi = udm.compute_voi("a1", 8.0, 2.0, sensor, eus, d)
     assert voi < 0.01
 
 
@@ -537,7 +604,6 @@ def test_udm_ask_wins_with_weak_prior():
     """
     udm = UnifiedDecisionMaker(
         question_cost=0.01,
-        action_cost=0.10,
     )
     d = DynamicsModel()
     sensor = BinarySensor(tp_alpha=9, tp_beta=1, fp_alpha=1, fp_beta=9)
@@ -573,7 +639,7 @@ def test_udm_take_when_cost_high():
 
 def test_udm_default_prior_is_one_over_n():
     """When beliefs dict is empty, default prior should be Beta(1/N, 1-1/N)."""
-    udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
+    udm = UnifiedDecisionMaker(question_cost=0.01)
     d = DynamicsModel()
 
     # 5 actions, so default prior mean = 1/5 = 0.2
@@ -596,7 +662,7 @@ def test_udm_decision_comparison_is_voi_vs_cost():
     This tests the C1 fix: with best_game_eu=0.05, VOI=0.03, c=0.01,
     the agent should ask (0.03 > 0.01) even though 0.02 < 0.05.
     """
-    udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
+    udm = UnifiedDecisionMaker(question_cost=0.01)
     d = DynamicsModel()
     d.register_state("s", 2)
     d.register_state("s2", 1)
@@ -616,13 +682,15 @@ def test_udm_decision_comparison_is_voi_vs_cost():
         dynamics=d,
         state_hash="s",
     )
-    # a2 EU = 0.2 + V(s2) - 0.10 = 0.2 + 0.5 - 0.10 = 0.60
-    # a1 EU = 0.5 + V₀ - 0.10 = 0.5 + 0.5 - 0.10 = 0.90
+    # a2 EU = 0.2 + γ·V(s2) - 0.10 (tried, via dynamics.q_value)
+    # a1 EU = 0.5 + γ·V₀ - 0.10 (untried, via dynamics.untried_q_value)
     # a1 is untried and already best, so VOI for a1 ≈ 0
     # But this test is about the comparison structure, not specific values
     v_s2 = d.state_value("s2")
     voi = udm.compute_voi("a1", 0.5, 0.5, sensor,
-                          {"a1": 0.5 + 0.5 - 0.10, "a2": 0.2 + v_s2 - 0.10})
+                          {"a1": d.untried_q_value(0.5),
+                           "a2": 0.2 + d.gamma * v_s2 - d.action_cost},
+                          d)
     if voi > 0.01:
         assert decision[0] == 'ask'
 
@@ -690,31 +758,34 @@ def test_categorical_sensor_get_stats():
 
 
 def test_categorical_voi_non_negative():
-    udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
+    udm = UnifiedDecisionMaker(question_cost=0.01)
+    d = DynamicsModel()
     cs = CategoricalSensor()
     voi = udm.compute_voi_categorical(
         ["a1", "a2", "a3"],
         {"a1": (0.33, 0.67), "a2": (0.33, 0.67), "a3": (0.33, 0.67)},
         cs,
+        d,
     )
     assert voi >= 0.0
 
 
 def test_categorical_voi_higher_with_accurate_sensor():
-    udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
+    udm = UnifiedDecisionMaker(question_cost=0.01)
+    d = DynamicsModel()
     weak = CategoricalSensor(accuracy_alpha=2, accuracy_beta=2)   # accuracy 0.5
     strong = CategoricalSensor(accuracy_alpha=9, accuracy_beta=1)  # accuracy 0.9
 
     beliefs = {"a1": (0.33, 0.67), "a2": (0.33, 0.67), "a3": (0.33, 0.67)}
-    voi_weak = udm.compute_voi_categorical(["a1", "a2", "a3"], beliefs, weak)
-    voi_strong = udm.compute_voi_categorical(["a1", "a2", "a3"], beliefs, strong)
+    voi_weak = udm.compute_voi_categorical(["a1", "a2", "a3"], beliefs, weak, d)
+    voi_strong = udm.compute_voi_categorical(["a1", "a2", "a3"], beliefs, strong, d)
 
     assert voi_strong >= voi_weak
 
 
 def test_categorical_voi_zero_when_all_known():
     """VOI is zero when dynamics has observations for all actions."""
-    udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
+    udm = UnifiedDecisionMaker(question_cost=0.01)
     cs = CategoricalSensor(accuracy_alpha=9, accuracy_beta=1)
     d = DynamicsModel()
     d.record_observation("s", "a1", "s2", 1.0)
@@ -726,13 +797,13 @@ def test_categorical_voi_zero_when_all_known():
     # don't change the decision since known rewards dominate).
     # With strongly peaked beliefs, VOI should be ~0.
     beliefs = {"a1": (100.0, 0.01), "a2": (0.01, 100.0)}
-    voi = udm.compute_voi_categorical(["a1", "a2"], beliefs, cs)
+    voi = udm.compute_voi_categorical(["a1", "a2"], beliefs, cs, d)
     assert voi < 0.01
 
 
 def test_categorical_sensor_choose_integrates():
     """UnifiedDecisionMaker.choose with categorical_sensor parameter."""
-    udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
+    udm = UnifiedDecisionMaker(question_cost=0.01)
     cs = CategoricalSensor(accuracy_alpha=9, accuracy_beta=1)
     d = DynamicsModel()
 
@@ -814,7 +885,7 @@ def test_dynamics_state_value_all_rewarding():
 
 def test_udm_prefers_state_change_over_noop():
     """State-changing r=0 action → Q > no-op Q (via Bellman state value)."""
-    udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
+    udm = UnifiedDecisionMaker(question_cost=0.01)
     d = DynamicsModel(action_cost=0.10, gamma=0.95)
     d.register_state("s", 2)
     d.register_state("s2", 5)  # unvisited successor with actions
@@ -832,14 +903,14 @@ def test_udm_prefers_state_change_over_noop():
         state_hash="s",
     )
     # V(s2) = 0.575 (5 untried: 1/5 + 0.95·0.5 - 0.10)
-    # "north": Q = 0 + V(s2) - 0.10, V(s2) > V(s)
-    # "look":  Q = 0 + V(s) - 0.10, V(s) self-loop limited
+    # "north": Q = 0 + γ·V(s2) - 0.10, V(s2) > V(s)
+    # "look":  Q = 0 + γ·V(s) - 0.10, V(s) self-loop limited
     assert decision == ('take', 'north')
 
 
 def test_udm_untried_beats_tried_zero():
     """Untried action preferred over tried r=0 no-op."""
-    udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
+    udm = UnifiedDecisionMaker(question_cost=0.01)
     d = DynamicsModel(action_cost=0.10, gamma=0.95)
     d.register_state("s", 2)
     d.record_observation("s", "look", "s", 0.0)
@@ -852,22 +923,23 @@ def test_udm_untried_beats_tried_zero():
         dynamics=d,
         state_hash="s",
     )
-    # "look":  Q = 0 + V(s) - 0.10, V(s) Bellman-limited by self-loop
-    # "north": Q = 0.5 + 0.5 - 0.10 = 0.90 (untried: belief mean + V₀)
+    # "look":  Q = 0 + γ·V(s) - 0.10, V(s) Bellman-limited by self-loop
+    # "north": Q = 0.5 + γ·V₀ - 0.10 = 0.875 (untried: belief mean + γ·V₀ - c_act)
     assert decision == ('take', 'north')
 
 
 def test_udm_voi_includes_v0():
-    """VOI > 0 for untried action with reliable sensor (V₀ in eu_if_yes)."""
-    udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
+    """VOI > 0 for untried action with reliable sensor (γ·V₀ in eu_if_yes)."""
+    udm = UnifiedDecisionMaker(question_cost=0.01)
+    d = DynamicsModel()
     sensor = BinarySensor(tp_alpha=9, tp_beta=1, fp_alpha=1, fp_beta=9)
 
-    # Compute game EUs: both untried, both get V₀
+    # Compute game EUs: both untried, both via dynamics.untried_q_value
     game_eus = {
-        "a1": 0.5 + 0.5 - 0.10,  # belief 0.5 + V₀ 0.5 - cost
-        "a2": 0.5 + 0.5 - 0.10,
+        "a1": d.untried_q_value(0.5),
+        "a2": d.untried_q_value(0.5),
     }
-    voi = udm.compute_voi("a1", 0.5, 0.5, sensor, game_eus)
+    voi = udm.compute_voi("a1", 0.5, 0.5, sensor, game_eus, d)
     assert voi > 0.0
 
 

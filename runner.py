@@ -186,7 +186,6 @@ class BayesianIFAgent:
         self.beliefs = BeliefState()
         self.decision_maker = UnifiedDecisionMaker(
             question_cost=question_cost,
-            action_cost=action_cost,
         )
 
         # Categorical suggestion sensor
@@ -336,14 +335,14 @@ Answer (YES or NO):"""
                 game_action = decision_value
                 obs = self.dynamics.get_observation(state_hash, game_action)
                 if obs is not None:
+                    eu = self.dynamics.q_value(state_hash, game_action)
                     v_next = self.dynamics.state_value(obs.next_state_hash)
-                    eu = obs.reward + v_next - self.decision_maker.action_cost
-                    explanation = f"EU={eu:.3f} (r={obs.reward:.1f}, V={v_next:.2f})"
+                    explanation = f"EU={eu:.3f} (r={obs.mean_reward:.1f}, V={v_next:.2f})"
                 else:
                     alpha, beta = action_beliefs.get(game_action, default_prior)
                     mean = alpha / (alpha + beta)
-                    eu = mean + self.decision_maker.v0 - self.decision_maker.action_cost
-                    explanation = f"EU={eu:.3f} (belief={mean:.2f}, V\u2080={self.decision_maker.v0:.1f})"
+                    eu = self.dynamics.untried_q_value(mean)
+                    explanation = f"EU={eu:.3f} (belief={mean:.2f})"
 
                 self.last_action = game_action
                 self.last_observation = observation

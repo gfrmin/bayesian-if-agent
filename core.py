@@ -406,12 +406,13 @@ class DynamicsModel:
     def __init__(self, action_cost: float = 0.10, gamma: float = 0.95):
         """
         Args:
-            action_cost: Cost per game action (same as UnifiedDecisionMaker).
+            action_cost: Cost per game action (opportunity cost per turn).
             gamma: Discount factor. 0.95 models finite horizon (γ^100 ≈ 0.006).
                    Prevents divergence in cycles (go east / go west).
         """
         self.action_cost = action_cost
         self.gamma = gamma
+        self.v_unknown: float = 0.5  # Beta(1,1) max-entropy prior for unvisited states
         self.observations: Dict[StateActionKey, ObservedOutcome] = {}
         self.tried_actions: Set[str] = set()
         self.total_observations: int = 0
@@ -474,6 +475,25 @@ class DynamicsModel:
             self._run_value_iteration()
         return self._cached_values.get(state_hash, 0.5)
 
+    def q_value(self, state_hash: str, action: str) -> Optional[float]:
+        """Q-value for a tried (state, action) pair using converged V(s').
+
+        Returns None if the action has not been observed in this state.
+        Single source of truth — same formula as value iteration.
+        """
+        obs = self.get_observation(state_hash, action)
+        if obs is None:
+            return None
+        v_next = self.state_value(obs.next_state_hash)
+        return obs.mean_reward + self.gamma * v_next - self.action_cost
+
+    def untried_q_value(self, belief_mean: float) -> float:
+        """Q-value for an untried action given belief about P(helps).
+
+        Single source of truth — same formula as value iteration.
+        """
+        return belief_mean + self.gamma * self.v_unknown - self.action_cost
+
     def _run_value_iteration(self):
         """Synchronous Bellman value iteration over the dynamics graph.
 
@@ -482,7 +502,7 @@ class DynamicsModel:
         Q(s, a_untried)  = 1/N + γ·V_unknown - c_act
         V(s_unknown)     = 0.5   (Beta(1,1) max-entropy prior)
         """
-        v_unknown = 0.5
+        v_unknown = self.v_unknown
 
         # Collect all states: registered states + successor states from observations
         all_states: Set[str] = set(self._state_n_total.keys())
@@ -560,15 +580,12 @@ class UnifiedDecisionMaker:
     Both action types evaluated by expected utility.
     """
 
-    def __init__(self, question_cost: float = 0.01, action_cost: float = 0.10):
+    def __init__(self, question_cost: float = 0.01):
         """
         Args:
             question_cost: Cost of asking one LLM question (in reward units).
-            action_cost: Cost of taking a game action (models limited turns).
         """
         self.question_cost = question_cost
-        self.action_cost = action_cost
-        self.v0 = 0.5  # V₀: value of unvisited state (Beta(1,1) prior)
 
     def choose(
         self,
@@ -592,16 +609,15 @@ class UnifiedDecisionMaker:
         n = len(game_actions)
         default_prior = (1.0 / n, 1.0 - 1.0 / n)
 
-        # Compute EU for all game actions (Q-values with state value)
+        # Compute EU for all game actions (Q-values via dynamics — single source of truth)
         game_eus = {}
         for action in game_actions:
-            obs = dynamics.get_observation(state_hash, action)
-            if obs is not None:
-                v_next = dynamics.state_value(obs.next_state_hash)
-                game_eus[action] = obs.reward + v_next - self.action_cost
+            q = dynamics.q_value(state_hash, action)
+            if q is not None:
+                game_eus[action] = q
             else:
                 alpha, beta = beliefs.get(action, default_prior)
-                game_eus[action] = alpha / (alpha + beta) + self.v0 - self.action_cost
+                game_eus[action] = dynamics.untried_q_value(alpha / (alpha + beta))
 
         best_game_action = max(game_actions, key=lambda a: game_eus[a])
 
@@ -614,7 +630,7 @@ class UnifiedDecisionMaker:
                 continue
 
             alpha, beta = beliefs.get(action, default_prior)
-            voi = self.compute_voi(action, alpha, beta, sensor, game_eus)
+            voi = self.compute_voi(action, alpha, beta, sensor, game_eus, dynamics)
             question_eu = voi - self.question_cost
 
             if question_eu > best_question_eu:
@@ -625,7 +641,7 @@ class UnifiedDecisionMaker:
         cat_eu = float('-inf')
         if categorical_sensor is not None:
             s_cost = suggestion_cost if suggestion_cost is not None else self.question_cost
-            cat_voi = self.compute_voi_categorical(game_actions, beliefs, categorical_sensor)
+            cat_voi = self.compute_voi_categorical(game_actions, beliefs, categorical_sensor, dynamics)
             cat_eu = cat_voi - s_cost
 
         # Pick best among: take, ask (binary), suggest (categorical)
@@ -645,6 +661,7 @@ class UnifiedDecisionMaker:
         beta: float,
         sensor: BinarySensor,
         all_game_eus: Dict[str, float],
+        dynamics: 'DynamicsModel',
     ) -> float:
         """
         Compute value of information for asking about this action.
@@ -666,9 +683,9 @@ class UnifiedDecisionMaker:
         posterior_if_yes = sensor.posterior(current_belief, said_yes=True)
         posterior_if_no = sensor.posterior(current_belief, said_yes=False)
 
-        # EU of this action under each posterior (includes V₀ and action cost)
-        eu_if_yes = posterior_if_yes * 1.0 + self.v0 - self.action_cost
-        eu_if_no = posterior_if_no * 1.0 + self.v0 - self.action_cost
+        # EU of this action under each posterior (via dynamics — single source of truth)
+        eu_if_yes = dynamics.untried_q_value(posterior_if_yes)
+        eu_if_no = dynamics.untried_q_value(posterior_if_no)
 
         # Best EU achievable after each answer
         other_best = max(
@@ -692,6 +709,7 @@ class UnifiedDecisionMaker:
         actions: List[str],
         beliefs: Dict[str, Tuple[float, float]],
         sensor: 'CategoricalSensor',
+        dynamics: 'DynamicsModel',
     ) -> float:
         """
         VOI for 'what should I do?' — one question updates all N beliefs.
@@ -709,7 +727,7 @@ class UnifiedDecisionMaker:
             a: beliefs.get(a, default_prior)[0] / sum(beliefs.get(a, default_prior))
             for a in actions
         }
-        current_best_eu = max(p - self.action_cost for p in priors.values())
+        current_best_eu = max(dynamics.untried_q_value(p) for p in priors.values())
 
         expected_best_after = 0.0
         for suggested in actions:
@@ -719,7 +737,7 @@ class UnifiedDecisionMaker:
                 for a in actions
             )
             post = sensor.posteriors(priors, suggested)
-            best_eu_after = max(post[a] - self.action_cost for a in actions)
+            best_eu_after = max(dynamics.untried_q_value(post[a]) for a in actions)
             expected_best_after += p_suggests * best_eu_after
 
         return max(0.0, expected_best_after - current_best_eu)
@@ -839,7 +857,7 @@ if __name__ == "__main__":
     print(f"\nDynamics stats: {stats}")
 
     # Test 7: UnifiedDecisionMaker (no action_prior — uses 1/N from beliefs)
-    dm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
+    dm = UnifiedDecisionMaker(question_cost=0.01)
 
     # When all actions known, should take best known
     dynamics2 = DynamicsModel()
@@ -874,8 +892,10 @@ if __name__ == "__main__":
     print(f"Decision (unknown, reliable sensor): {decision2}")
 
     # VOI computation (now takes alpha, beta instead of point estimate)
-    # EUs include V₀: belief_mean + V₀ - action_cost
-    voi = dm.compute_voi("a1", 0.5, 0.5, sensor3, {"a1": 0.5 + 0.5 - 0.10, "a2": 0.5 + 0.5 - 0.10})
+    # EUs via dynamics.untried_q_value: belief_mean + γ·V₀ - action_cost
+    voi = dm.compute_voi("a1", 0.5, 0.5, sensor3,
+                         {"a1": dynamics3.untried_q_value(0.5), "a2": dynamics3.untried_q_value(0.5)},
+                         dynamics3)
     assert voi >= 0
     print(f"VOI: {voi:.4f}")
 
@@ -917,12 +937,14 @@ if __name__ == "__main__":
     print(f"CategoricalSensor stats: {stats}")
 
     # Test 9: VOI categorical
-    dm2 = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
+    dm2 = UnifiedDecisionMaker(question_cost=0.01)
+    dynamics4 = DynamicsModel()
     cat2 = CategoricalSensor(accuracy_alpha=8, accuracy_beta=2)  # accuracy 0.8
     voi_cat = dm2.compute_voi_categorical(
         ["a1", "a2", "a3"],
         {"a1": (0.33, 0.67), "a2": (0.33, 0.67), "a3": (0.33, 0.67)},
         cat2,
+        dynamics4,
     )
     assert voi_cat >= 0
     print(f"\nVOI categorical: {voi_cat:.4f}")
