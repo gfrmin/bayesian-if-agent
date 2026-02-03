@@ -394,6 +394,10 @@ class DynamicsModel:
         self.observations: Dict[StateActionKey, ObservedOutcome] = {}
         self.tried_actions: Set[str] = set()
         self.total_observations: int = 0
+        # Per-state tracking for V(s)
+        self._state_tried: Dict[str, int] = {}
+        self._state_rewards: Dict[str, int] = {}
+        self._state_n_total: Dict[str, int] = {}
 
     def has_observation(self, state_hash: str, action: str) -> bool:
         """Have we tried this action in this state?"""
@@ -402,6 +406,10 @@ class DynamicsModel:
     def get_observation(self, state_hash: str, action: str) -> Optional[ObservedOutcome]:
         """Get observed outcome if we have one."""
         return self.observations.get(StateActionKey(state_hash, action))
+
+    def register_state(self, state_hash: str, n_total: int):
+        """Register the total number of actions available in a state."""
+        self._state_n_total[state_hash] = n_total
 
     def record_observation(
         self,
@@ -413,6 +421,7 @@ class DynamicsModel:
     ):
         """Record an observed outcome."""
         key = StateActionKey(state_hash, action)
+        is_new = key not in self.observations
         self.observations[key] = ObservedOutcome(
             next_state_hash=next_state_hash,
             reward=reward,
@@ -420,11 +429,31 @@ class DynamicsModel:
         )
         self.tried_actions.add(action)
         self.total_observations += 1
+        if is_new:
+            self._state_tried[state_hash] = self._state_tried.get(state_hash, 0) + 1
+            if reward > 0:
+                self._state_rewards[state_hash] = self._state_rewards.get(state_hash, 0) + 1
 
     def known_reward(self, state_hash: str, action: str) -> Optional[float]:
         """Get known reward for state-action pair. None if unobserved."""
         obs = self.get_observation(state_hash, action)
         return obs.reward if obs else None
+
+    def state_value(self, state_hash: str) -> float:
+        """V(s): estimated value of a state based on exploration history.
+
+        Beta(1+r, 1+f) mean × untried_fraction.
+        Returns V₀ = 0.5 for unregistered/unvisited states.
+        """
+        n_total = self._state_n_total.get(state_hash, 0)
+        if n_total == 0:
+            return 0.5  # V₀: Beta(1,1) maximum-entropy prior
+        n_tried = self._state_tried.get(state_hash, 0)
+        n_rewards = self._state_rewards.get(state_hash, 0)
+        n_untried = max(0, n_total - n_tried)
+        beta_mean = (1 + n_rewards) / (2 + n_tried)
+        untried_frac = n_untried / n_total
+        return beta_mean * untried_frac
 
     def get_stats(self) -> dict:
         return {
@@ -453,6 +482,7 @@ class UnifiedDecisionMaker:
         """
         self.question_cost = question_cost
         self.action_cost = action_cost
+        self.v0 = 0.5  # V₀: value of unvisited state (Beta(1,1) prior)
 
     def choose(
         self,
@@ -476,15 +506,16 @@ class UnifiedDecisionMaker:
         n = len(game_actions)
         default_prior = (1.0 / n, 1.0 - 1.0 / n)
 
-        # Compute EU for all game actions
+        # Compute EU for all game actions (Q-values with state value)
         game_eus = {}
         for action in game_actions:
-            known = dynamics.known_reward(state_hash, action)
-            if known is not None:
-                game_eus[action] = known - self.action_cost
+            obs = dynamics.get_observation(state_hash, action)
+            if obs is not None:
+                v_next = dynamics.state_value(obs.next_state_hash)
+                game_eus[action] = obs.reward + v_next - self.action_cost
             else:
                 alpha, beta = beliefs.get(action, default_prior)
-                game_eus[action] = alpha / (alpha + beta) - self.action_cost
+                game_eus[action] = alpha / (alpha + beta) + self.v0 - self.action_cost
 
         best_game_action = max(game_actions, key=lambda a: game_eus[a])
 
@@ -549,9 +580,9 @@ class UnifiedDecisionMaker:
         posterior_if_yes = sensor.posterior(current_belief, said_yes=True)
         posterior_if_no = sensor.posterior(current_belief, said_yes=False)
 
-        # EU of this action under each posterior (includes action cost)
-        eu_if_yes = posterior_if_yes * 1.0 - self.action_cost
-        eu_if_no = posterior_if_no * 1.0 - self.action_cost
+        # EU of this action under each posterior (includes V₀ and action cost)
+        eu_if_yes = posterior_if_yes * 1.0 + self.v0 - self.action_cost
+        eu_if_no = posterior_if_no * 1.0 + self.v0 - self.action_cost
 
         # Best EU achievable after each answer
         other_best = max(
@@ -724,7 +755,9 @@ if __name__ == "__main__":
     # When all actions known, should take best known
     dynamics2 = DynamicsModel()
     dynamics2.record_observation("s", "a1", "s2", 5.0)
-    dynamics2.record_observation("s", "a2", "s2", 0.0)
+    dynamics2.record_observation("s", "a2", "s", 0.0)
+    dynamics2.register_state("s", 2)
+    dynamics2.register_state("s2", 1)  # register successor
 
     decision = dm.choose(
         game_actions=["a1", "a2"],
@@ -752,7 +785,8 @@ if __name__ == "__main__":
     print(f"Decision (unknown, reliable sensor): {decision2}")
 
     # VOI computation (now takes alpha, beta instead of point estimate)
-    voi = dm.compute_voi("a1", 0.5, 0.5, sensor3, {"a1": 0.4, "a2": 0.4})
+    # EUs include V₀: belief_mean + V₀ - action_cost
+    voi = dm.compute_voi("a1", 0.5, 0.5, sensor3, {"a1": 0.5 + 0.5 - 0.10, "a2": 0.5 + 0.5 - 0.10})
     assert voi >= 0
     print(f"VOI: {voi:.4f}")
 

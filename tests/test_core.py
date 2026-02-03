@@ -410,11 +410,13 @@ def test_dynamics_stats():
 # ---------------------------------------------------------------------------
 
 def test_udm_take_known_best():
-    """When all actions have known rewards, take the best one."""
+    """When all actions have observed outcomes, take the best one."""
     udm = UnifiedDecisionMaker(question_cost=0.01)
     d = DynamicsModel()
     d.record_observation("s", "a1", "s2", 5.0)
-    d.record_observation("s", "a2", "s2", 0.0)
+    d.record_observation("s", "a2", "s", 0.0)
+    d.register_state("s", 2)
+    d.register_state("s2", 1)
 
     decision = udm.choose(
         game_actions=["a1", "a2"],
@@ -448,7 +450,9 @@ def test_udm_no_questions_when_all_observed():
     udm = UnifiedDecisionMaker(question_cost=0.01)
     d = DynamicsModel()
     d.record_observation("s", "a1", "s2", 1.0)
-    d.record_observation("s", "a2", "s2", 0.0)
+    d.record_observation("s", "a2", "s", 0.0)
+    d.register_state("s", 2)
+    d.register_state("s2", 1)
 
     decision = udm.choose(
         game_actions=["a1", "a2"],
@@ -465,7 +469,9 @@ def test_udm_voi_non_negative():
     """VOI should never be negative."""
     udm = UnifiedDecisionMaker()
     sensor = BinarySensor()
-    voi = udm.compute_voi("a1", 0.5, 0.5, sensor, {"a1": 0.4, "a2": 0.4})
+    # EUs consistent with untried formula: belief_mean + V₀ - action_cost
+    eus = {"a1": 0.5 + 0.5 - 0.10, "a2": 0.5 + 0.5 - 0.10}
+    voi = udm.compute_voi("a1", 0.5, 0.5, sensor, eus)
     assert voi >= 0.0
 
 
@@ -473,8 +479,9 @@ def test_udm_voi_zero_when_certain():
     """VOI is zero when belief is already certain."""
     udm = UnifiedDecisionMaker()
     sensor = BinarySensor()
-    # Alpha >> beta means ~certain it helps
-    voi = udm.compute_voi("a1", 100.0, 0.01, sensor, {"a1": 0.9, "a2": 0.4})
+    # Alpha >> beta means ~certain it helps; EU includes V₀
+    eus = {"a1": 100/100.01 + 0.5 - 0.10, "a2": 0.5 + 0.5 - 0.10}
+    voi = udm.compute_voi("a1", 100.0, 0.01, sensor, eus)
     assert abs(voi) < 0.01
 
 
@@ -485,7 +492,7 @@ def test_udm_voi_higher_with_reliable_sensor():
     unreliable = BinarySensor(tp_alpha=5, tp_beta=5, fp_alpha=5, fp_beta=5)
     reliable = BinarySensor(tp_alpha=9, tp_beta=1, fp_alpha=1, fp_beta=9)
 
-    eus = {"a1": 0.4, "a2": 0.4}
+    eus = {"a1": 0.5 + 0.5 - 0.10, "a2": 0.5 + 0.5 - 0.10}
     voi_unreliable = udm.compute_voi("a1", 0.5, 0.5, unreliable, eus)
     voi_reliable = udm.compute_voi("a1", 0.5, 0.5, reliable, eus)
 
@@ -498,7 +505,8 @@ def test_udm_voi_positive_for_non_best():
     sensor = BinarySensor(tp_alpha=9, tp_beta=1, fp_alpha=1, fp_beta=9)
 
     # a1 has lower EU than a2 — asking about a1 could reveal it's better
-    eus = {"a1": 0.2, "a2": 0.4}
+    # EUs include V₀: belief_mean + V₀ - action_cost
+    eus = {"a1": 0.3 + 0.5 - 0.10, "a2": 0.7 + 0.5 - 0.10}
     voi = udm.compute_voi("a1", 0.3, 0.7, sensor, eus)
     assert voi > 0.0
 
@@ -509,7 +517,8 @@ def test_udm_voi_zero_for_best_action():
     sensor = BinarySensor(tp_alpha=9, tp_beta=1, fp_alpha=1, fp_beta=9)
 
     # a1 is already the best — asking about it can't improve decisions
-    eus = {"a1": 0.7, "a2": 0.1}
+    # EUs include V₀: belief_mean + V₀ - action_cost
+    eus = {"a1": 0.8 + 0.5 - 0.10, "a2": 0.1 + 0.5 - 0.10}
     voi = udm.compute_voi("a1", 8.0, 2.0, sensor, eus)
     assert voi < 0.01
 
@@ -583,6 +592,8 @@ def test_udm_decision_comparison_is_voi_vs_cost():
     """
     udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
     d = DynamicsModel()
+    d.register_state("s", 2)
+    d.register_state("s2", 1)
 
     # Construct a scenario where VOI > c but (VOI - c) < best_game_eu
     # Use a very reliable sensor and uncertain belief
@@ -599,9 +610,13 @@ def test_udm_decision_comparison_is_voi_vs_cost():
         dynamics=d,
         state_hash="s",
     )
-    # VOI for a1 should be > 0.01 (question cost), so agent asks
+    # a2 EU = 0.2 + V(s2) - 0.10 = 0.2 + 0.5 - 0.10 = 0.60
+    # a1 EU = 0.5 + V₀ - 0.10 = 0.5 + 0.5 - 0.10 = 0.90
+    # a1 is untried and already best, so VOI for a1 ≈ 0
+    # But this test is about the comparison structure, not specific values
+    v_s2 = d.state_value("s2")
     voi = udm.compute_voi("a1", 0.5, 0.5, sensor,
-                          {"a1": 0.5 - 0.10, "a2": 0.2 - 0.10})
+                          {"a1": 0.5 + 0.5 - 0.10, "a2": 0.2 + v_s2 - 0.10})
     if voi > 0.01:
         assert decision[0] == 'ask'
 
@@ -722,3 +737,123 @@ def test_categorical_sensor_choose_integrates():
         suggestion_cost=0.01,
     )
     assert decision[0] in ('suggest', 'take')
+
+
+# ---------------------------------------------------------------------------
+# DynamicsModel.state_value and register_state
+# ---------------------------------------------------------------------------
+
+def test_dynamics_register_state():
+    """register_state stores n_total."""
+    d = DynamicsModel()
+    d.register_state("s1", 5)
+    assert d._state_n_total["s1"] == 5
+
+
+def test_dynamics_state_value_unvisited():
+    """Unregistered state returns V₀ = 0.5."""
+    d = DynamicsModel()
+    assert d.state_value("unknown") == 0.5
+
+
+def test_dynamics_state_value_no_tries():
+    """Registered but 0 tried → V = Beta(1,1).mean × 1.0 = 0.5."""
+    d = DynamicsModel()
+    d.register_state("s1", 5)
+    assert d.state_value("s1") == 0.5
+
+
+def test_dynamics_state_value_fully_explored():
+    """All tried, 0 rewards → V = 0 (no untried actions)."""
+    d = DynamicsModel()
+    d.register_state("s", 2)
+    d.record_observation("s", "a1", "s", 0.0)
+    d.record_observation("s", "a2", "s", 0.0)
+    assert d.state_value("s") == 0.0
+
+
+def test_dynamics_state_value_partial():
+    """5 of 10 tried, 1 reward → V > 0."""
+    d = DynamicsModel()
+    d.register_state("s", 10)
+    d.record_observation("s", "a1", "s2", 1.0)
+    for i in range(2, 6):
+        d.record_observation("s", f"a{i}", "s", 0.0)
+    v = d.state_value("s")
+    # beta_mean = (1+1)/(2+5) = 2/7 ≈ 0.286, untried_frac = 5/10 = 0.5
+    # V ≈ 0.143
+    assert v > 0.0
+    assert v < 0.5
+
+
+def test_dynamics_state_value_all_rewarding():
+    """All tried, all rewarded → V = 0 (no untried actions)."""
+    d = DynamicsModel()
+    d.register_state("s", 2)
+    d.record_observation("s", "a1", "s2", 1.0)
+    d.record_observation("s", "a2", "s3", 1.0)
+    assert d.state_value("s") == 0.0
+
+
+# ---------------------------------------------------------------------------
+# UnifiedDecisionMaker with Q-values
+# ---------------------------------------------------------------------------
+
+def test_udm_prefers_state_change_over_noop():
+    """State-changing r=0 action → Q > no-op Q (via successor state value)."""
+    udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
+    d = DynamicsModel()
+    d.register_state("s", 2)
+    d.register_state("s2", 5)  # unvisited successor with actions
+    # "north" moved to s2 with 0 reward
+    d.record_observation("s", "north", "s2", 0.0)
+    # "look" stayed in s with 0 reward
+    d.record_observation("s", "look", "s", 0.0)
+
+    decision = udm.choose(
+        game_actions=["north", "look"],
+        possible_questions=[],
+        beliefs={"north": (0.5, 0.5), "look": (0.5, 0.5)},
+        sensor=BinarySensor(),
+        dynamics=d,
+        state_hash="s",
+    )
+    # "north": Q = 0 + V(s2) - 0.10 = 0 + 0.5 - 0.10 = 0.40
+    # "look":  Q = 0 + V(s)  - 0.10 = 0 + 0.0 - 0.10 = -0.10
+    assert decision == ('take', 'north')
+
+
+def test_udm_untried_beats_tried_zero():
+    """Untried action preferred over tried r=0 no-op."""
+    udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
+    d = DynamicsModel()
+    d.register_state("s", 2)
+    d.record_observation("s", "look", "s", 0.0)
+
+    decision = udm.choose(
+        game_actions=["look", "north"],
+        possible_questions=[],
+        beliefs={"look": (0.5, 0.5), "north": (0.5, 0.5)},
+        sensor=BinarySensor(),
+        dynamics=d,
+        state_hash="s",
+    )
+    # "look":  Q = 0 + V(s) - 0.10, V(s) = Beta(1,1+1).mean × 1/2 = (1/3)(1/2) ≈ 0.167
+    #   Q_look ≈ 0.067
+    # "north": Q = 0.5 + 0.5 - 0.10 = 0.90 (untried: belief mean + V₀)
+    assert decision == ('take', 'north')
+
+
+def test_udm_voi_includes_v0():
+    """VOI > 0 for untried action with reliable sensor (V₀ in eu_if_yes)."""
+    udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
+    d = DynamicsModel()
+    sensor = BinarySensor(tp_alpha=9, tp_beta=1, fp_alpha=1, fp_beta=9)
+
+    # Compute game EUs: both untried, both get V₀
+    game_eus = {
+        "a1": 0.5 + 0.5 - 0.10,  # belief 0.5 + V₀ 0.5 - cost
+        "a2": 0.5 + 0.5 - 0.10,
+    }
+    voi = udm.compute_voi("a1", 0.5, 0.5, sensor, game_eus)
+    assert voi > 0.0

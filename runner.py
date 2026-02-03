@@ -244,6 +244,7 @@ Answer (YES or NO):"""
         state_hash = self.get_state_hash(env)
         self.current_state_hash = state_hash
         valid_actions = env.get_valid_actions() or ["look"]
+        self.dynamics.register_state(state_hash, len(valid_actions))
 
         context = f"Observation: {observation[:500]}\n\n{self.beliefs.to_context_string()}"
 
@@ -300,13 +301,16 @@ Answer (YES or NO):"""
 
             if decision_type == 'take':
                 game_action = decision_value
-                known = self.dynamics.known_reward(state_hash, game_action)
-                if known is not None:
-                    explanation = f"EU={known:.3f} (known)"
+                obs = self.dynamics.get_observation(state_hash, game_action)
+                if obs is not None:
+                    v_next = self.dynamics.state_value(obs.next_state_hash)
+                    eu = obs.reward + v_next - self.decision_maker.action_cost
+                    explanation = f"EU={eu:.3f} (r={obs.reward:.1f}, V={v_next:.2f})"
                 else:
                     alpha, beta = action_beliefs.get(game_action, default_prior)
                     mean = alpha / (alpha + beta)
-                    explanation = f"EU={mean:.3f} (belief={mean:.2f})"
+                    eu = mean + self.decision_maker.v0 - self.decision_maker.action_cost
+                    explanation = f"EU={eu:.3f} (belief={mean:.2f}, V\u2080={self.decision_maker.v0:.1f})"
 
                 self.last_action = game_action
                 self.last_observation = observation
