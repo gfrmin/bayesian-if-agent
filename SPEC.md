@@ -249,7 +249,9 @@ The LLM sensor gives a noisy binary observation about action A. The exact Bayesi
 
 $$P(\theta | \text{obs}) \propto P(\text{obs} | \theta) \, P(\theta)$$
 
-where $P(\text{yes} | \theta) = \text{TPR} \cdot \theta + \text{FPR} \cdot (1 - \theta)$. This likelihood is linear in θ, so the posterior is **not** Beta — the conjugacy breaks. The implementation must approximate, e.g. by moment-matching back to a Beta. The spec does not prescribe a specific approximation; what matters is that the update is derived from Bayes' rule with the sensor's learned TPR/FPR, and that the result is a proper distribution (not a bare point estimate).
+where $P(\text{yes} | \theta) = \text{TPR} \cdot \theta + \text{FPR} \cdot (1 - \theta)$. This likelihood is linear in θ, so the posterior is **not** Beta — the conjugacy breaks. The implementation approximates by moment-matching: compute the posterior mean via Bayes' rule, then form a new Beta with the same mean and total count incremented by evidence weight $w$.
+
+**Evidence-weighted moment-matching:** The total count increment is scaled by $w = \min(w_{\text{TPR}}, w_{\text{FPR}})$ where $w_x = \max(0, (n_x - n_{\text{prior},x}) / n_x)$ and $n_{\text{prior}}$ is the sum of prior pseudocounts (3 for each of TPR Beta(2,1) and FPR Beta(1,2)). An untested sensor (at prior) contributes weight 0; the agent's beliefs are unchanged. As ground truth accumulates, w approaches 1 and sensor observations have full weight. This prevents an uncalibrated sensor from inflating beliefs.
 
 ### Why not 0.5?
 
@@ -341,24 +343,97 @@ class BinarySensor:
                 self.fp_beta += 1
 ```
 
+### State Identity: Score-Augmented Hashing
+
+The Bellman equation requires Markov states: the transition and reward from state s under action a must not depend on history. Jericho's `get_world_state_hash()` alone is not Markov — the same world state hash can yield different rewards depending on whether a score event has already fired. For example, `(fb9592, frotz book)` gives r=20 the first time but r=0 thereafter.
+
+**Fix:** Augment the state hash with the current score:
+
+```python
+def get_state_hash(self, env):
+    return f"{env.get_world_state_hash()}_{env.get_score()}"
+```
+
+Now `fb9592_0` (before scoring) and `fb9592_20` (after scoring) are distinct states. The dynamics model correctly records `(fb9592_0, frotz) → r=20 → s'_20` and `(fb9592_20, frotz) → r=0 → s'_20`. Value iteration no longer treats one-time rewards as repeatable.
+
 ### DynamicsModel
 
 ```python
 class DynamicsModel:
-    """Records observed outcomes. Deterministic game = one observation = certainty."""
-    
-    def __init__(self):
-        self.observations: Dict[Tuple[str, str], float] = {}  # (state, action) -> reward
-    
-    def record(self, state: str, action: str, reward: float):
-        self.observations[(state, action)] = reward
-    
-    def known_reward(self, state: str, action: str) -> Optional[float]:
-        return self.observations.get((state, action))
-    
-    def is_known(self, state: str, action: str) -> bool:
-        return (state, action) in self.observations
+    """Records observed outcomes and computes Bellman state values."""
+
+    def __init__(self, action_cost: float = 0.10, gamma: float = 0.95):
+        self.action_cost = action_cost
+        self.gamma = gamma
+        self.observations: Dict[Tuple[str, str], Outcome] = {}
+        self._state_n_total: Dict[str, int] = {}  # registered action counts
+        self._cached_values: Dict[str, float] = {}
+        self._values_dirty: bool = True
+
+    def record(self, state, action, next_state, reward):
+        # Accumulate: running mean for non-stationary rewards
+        existing = self.observations.get((state, action))
+        if existing:
+            existing.visit_count += 1
+            existing.reward_sum += reward
+            existing.reward = existing.mean_reward
+            existing.next_state = next_state
+        else:
+            self.observations[(state, action)] = Outcome(next_state, reward)
+        self._values_dirty = True
+
+    def state_value(self, state: str) -> float:
+        if self._values_dirty:
+            self._run_value_iteration()
+        return self._cached_values.get(state, 0.5)  # V₀ for unknown
+
+    def _run_value_iteration(self):
+        """V(s) = max_a Q(s,a) via synchronous iteration until convergence."""
+        # Uses obs.mean_reward instead of obs.reward — see § Reward Model
+        ...
 ```
+
+### Reward Model: Running Mean
+
+For any residual non-stationarity not captured by score augmentation (e.g., hidden game flags not reflected in the world state hash), model R(s,a) as a running mean:
+
+$$\hat{R}(s, a) = \frac{\sum_{i=1}^{n} r_i}{n}$$
+
+where n is the visit count for (s, a). Each `ObservedOutcome` tracks `visit_count` and `reward_sum`. Value iteration uses `mean_reward` instead of a single `reward` value.
+
+After score augmentation, most (state, action) pairs are visited only once, so this is primarily a safety net. When the same pair is revisited with different rewards (hidden state not in hash), the mean converges to truth.
+
+### State Values: Bellman V(s)
+
+The agent needs V(s) — the value of being in state s — to compare actions that lead to different successor states. A simple heuristic (e.g. fraction of untried actions) collapses to ~0 when most actions are tried, making the agent rationally replay known-rewarding actions instead of exploring forward.
+
+**Bellman equation over the learned dynamics graph:**
+
+$$V(s) = \max_a Q(s, a)$$
+
+For tried actions with known transitions:
+$$Q(s, a_{\text{tried}}) = \hat{R}(s, a) + \gamma \cdot V(s') - c_{\text{act}}$$
+
+For untried actions (structural prior):
+$$Q(s, a_{\text{untried}}) = \frac{1}{N} + \gamma \cdot V_{\text{unknown}} - c_{\text{act}}$$
+
+For states not in the dynamics graph:
+$$V(s_{\text{unknown}}) = 0.5 \quad \text{(Beta(1,1) max-entropy prior)}$$
+
+**Parameters:**
+
+| Parameter | Value | Justification |
+|-----------|-------|---------------|
+| γ | 0.95 | Finite horizon: γ^100 ≈ 0.006, so rewards >60 steps away are negligible. Prevents divergence in cycles (go east / go west). Standard for finite-horizon MDPs. |
+| c_act | 0.10 | Same as UnifiedDecisionMaker — opportunity cost per turn. |
+| V_unknown | 0.5 | Beta(1,1) maximum-entropy prior for unvisited states. |
+| 1/N | structural | Mean of Beta(1/N, 1−1/N) — one untried action helps, don't know which. |
+
+**Why not a heuristic?**
+
+The previous `V(s) = beta_mean × untried_frac` collapses to ~0 when most actions are tried. A state leading to +10 reward gets V(s) ≈ 0.06. The agent then rationally exploits known rewards and never explores forward. Bellman propagates rewards through the dynamics graph: a chain s0→s1→s2 with reward at s1→s2 gives V(s0) > 0, correctly reflecting the discoverable reward.
+
+**Implementation:** Synchronous value iteration. Iterate `V(s) = max_a Q(s,a)` over all states in the dynamics graph until `max_delta < 1e-6` or 100 iterations. Cached with dirty flag — recomputed only when the dynamics graph changes (new observations or state registrations).
 
 ### UnifiedDecisionMaker
 
@@ -527,13 +602,12 @@ class BayesianIFAgent:
             self.sensor.update(said_yes, helped)
             del self.pending_predictions[action]
 
-        # Update action belief from ground truth (exact conjugate update)
-        if action in self.beliefs:
-            alpha, beta = self.beliefs[action]
-            if helped:
-                self.beliefs[action] = (alpha + 1, beta)
-            else:
-                self.beliefs[action] = (alpha, beta + 1)
+        # Update action belief from ground truth (always, even first observation)
+        alpha, beta = self.beliefs.get(action, (1.0/n, 1.0 - 1.0/n))
+        if helped:
+            self.beliefs[action] = (alpha + 1, beta)
+        else:
+            self.beliefs[action] = (alpha, beta + 1)
 ```
 
 ---
@@ -547,6 +621,7 @@ class BayesianIFAgent:
 | prior P(helps) | Beta(1/N, 1−1/N) | Mean 1/N (one action helps, don't know which), total count 1 (maximally weak). Derived from problem structure. |
 | TPR prior | Beta(2, 1) | Expect LLM is somewhat reliable (mean 0.67). |
 | FPR prior | Beta(1, 2) | Expect LLM doesn't say yes to everything (mean 0.33). |
+| Categorical accuracy prior | Beta(1, 1) | Max-entropy for untested sensor. No assumption about accuracy before calibration. |
 
 These can be tuned. But they must be justified, not arbitrary.
 
@@ -600,7 +675,7 @@ A categorical question — "which action should I take?" — addresses both. One
 
 **Question:** Present numbered action list, ask LLM to pick one.
 
-**Accuracy:** Scalar $a \sim \text{Beta}(\alpha, \beta)$, prior Beta(2, 1) (mean 0.67).
+**Accuracy:** Scalar $a \sim \text{Beta}(\alpha, \beta)$, prior Beta(1, 1) (mean 0.5, max-entropy for untested sensor).
 
 **Likelihood:**
 $$P(\text{LLM suggests } i \mid \text{action } j \text{ is correct}) = \begin{cases} a & \text{if } i = j \\ \frac{1-a}{N-1} & \text{if } i \neq j \end{cases}$$
@@ -608,7 +683,7 @@ $$P(\text{LLM suggests } i \mid \text{action } j \text{ is correct}) = \begin{ca
 **Posterior via Bayes' rule:**
 $$P(\text{action } j \text{ correct} \mid \text{LLM suggests } i) = \frac{P(\text{suggests } i \mid j) \cdot P(j)}{\sum_k P(\text{suggests } i \mid k) \cdot P(k)}$$
 
-**Moment-matching:** The categorical posterior is converted back to Beta parameters for each action by preserving total count (incremented by 1) and setting the mean to the posterior.
+**Moment-matching:** The categorical posterior is converted back to Beta parameters for each action by preserving total count (incremented by evidence weight w) and setting the mean to the posterior. The evidence weight $w = \max(0, (n_{\text{total}} - n_{\text{prior}}) / n_{\text{total}})$ where $n_{\text{prior}}$ is the sum of prior pseudocounts (2 for Beta(1,1)). An untested sensor contributes weight 0; as evidence accumulates, w approaches 1. This prevents belief inflation from an untested categorical sensor.
 
 ### VOI for Categorical Suggestion
 

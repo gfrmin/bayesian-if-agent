@@ -344,11 +344,15 @@ def test_observed_outcome_construction():
     assert o.next_state_hash == "h2"
     assert o.reward == 1.0
     assert o.observation_text == "text"
+    assert o.visit_count == 1
+    assert o.reward_sum == 1.0
+    assert o.mean_reward == 1.0
 
 
 def test_observed_outcome_default_text():
     o = ObservedOutcome(next_state_hash="h2", reward=0.0)
     assert o.observation_text == ""
+    assert o.mean_reward == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -382,15 +386,17 @@ def test_dynamics_tried_actions():
     assert "jump" not in d.tried_actions
 
 
-def test_dynamics_deterministic_overwrite():
+def test_dynamics_accumulates_visits():
     d = DynamicsModel()
     d.record_observation("s1", "go", "s2", 1.0, "first")
     d.record_observation("s1", "go", "s2", 1.0, "second")
-    # In deterministic game, second observation overwrites
     assert d.get_stats()["unique_state_actions"] == 1
     assert d.total_observations == 2
     obs = d.get_observation("s1", "go")
     assert obs.observation_text == "second"
+    assert obs.visit_count == 2
+    assert obs.reward_sum == 2.0
+    assert obs.mean_reward == 1.0
 
 
 def test_dynamics_stats():
@@ -655,6 +661,11 @@ def test_categorical_sensor_non_suggested_lowered():
     assert post["d"] < priors["d"]
 
 
+def test_categorical_sensor_initial_accuracy():
+    cs = CategoricalSensor()
+    assert abs(cs.accuracy - 0.5) < 0.01  # Beta(1,1) max-entropy
+
+
 def test_categorical_sensor_accuracy_learns():
     cs = CategoricalSensor()
     initial = cs.accuracy
@@ -662,8 +673,8 @@ def test_categorical_sensor_accuracy_learns():
     assert cs.accuracy > initial
     cs.update(suggested_correct=False)
     cs.update(suggested_correct=False)
-    # After 1 correct, 2 incorrect from Beta(2,1): Beta(3,3), mean 0.5
-    assert abs(cs.accuracy - 0.5) < 0.01
+    # After 1 correct, 2 incorrect from Beta(1,1): Beta(2,3), mean 0.4
+    assert abs(cs.accuracy - 0.4) < 0.01
     assert cs.ground_truth_count == 3
 
 
@@ -757,42 +768,44 @@ def test_dynamics_state_value_unvisited():
 
 
 def test_dynamics_state_value_no_tries():
-    """Registered but 0 tried → V = Beta(1,1).mean × 1.0 = 0.5."""
+    """Registered but 0 tried → Bellman V from untried prior: 1/N + γ·0.5 - c_act."""
     d = DynamicsModel()
     d.register_state("s1", 5)
-    assert d.state_value("s1") == 0.5
+    # Q_untried = 1/5 + 0.95·0.5 - 0.10 = 0.575
+    assert d.state_value("s1") > 0.4
 
 
 def test_dynamics_state_value_fully_explored():
-    """All tried, 0 rewards → V = 0 (no untried actions)."""
+    """All tried, 0 rewards, self-loop → V < 0 (dead-end state)."""
     d = DynamicsModel()
     d.register_state("s", 2)
     d.record_observation("s", "a1", "s", 0.0)
     d.record_observation("s", "a2", "s", 0.0)
-    assert d.state_value("s") == 0.0
+    # V(s) = 0.95·V(s) - 0.10 → V(s) = -0.10/0.05 = -2.0
+    assert d.state_value("s") < 0
 
 
 def test_dynamics_state_value_partial():
-    """5 of 10 tried, 1 reward → V > 0."""
+    """5 of 10 tried, 1 reward → V > 0.5 (reward propagates via Bellman)."""
     d = DynamicsModel()
     d.register_state("s", 10)
     d.record_observation("s", "a1", "s2", 1.0)
     for i in range(2, 6):
         d.record_observation("s", f"a{i}", "s", 0.0)
     v = d.state_value("s")
-    # beta_mean = (1+1)/(2+5) = 2/7 ≈ 0.286, untried_frac = 5/10 = 0.5
-    # V ≈ 0.143
-    assert v > 0.0
-    assert v < 0.5
+    # Q(a1) = 1.0 + 0.95·V(s2) - 0.10 = 1.375 (s2 unknown → V=0.5)
+    # V(s) = max(Q(a1), Q_untried, Q_self_loop) ≥ 1.375
+    assert v > 0.5
 
 
 def test_dynamics_state_value_all_rewarding():
-    """All tried, all rewarded → V = 0 (no untried actions)."""
+    """All tried, all rewarded → V > 0 (rewards propagate via Bellman)."""
     d = DynamicsModel()
     d.register_state("s", 2)
     d.record_observation("s", "a1", "s2", 1.0)
     d.record_observation("s", "a2", "s3", 1.0)
-    assert d.state_value("s") == 0.0
+    # Q(a1) = 1.0 + 0.95·V(s2) - 0.10 = 1.375 (s2, s3 unknown → V=0.5)
+    assert d.state_value("s") > 0
 
 
 # ---------------------------------------------------------------------------
@@ -800,9 +813,9 @@ def test_dynamics_state_value_all_rewarding():
 # ---------------------------------------------------------------------------
 
 def test_udm_prefers_state_change_over_noop():
-    """State-changing r=0 action → Q > no-op Q (via successor state value)."""
+    """State-changing r=0 action → Q > no-op Q (via Bellman state value)."""
     udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
-    d = DynamicsModel()
+    d = DynamicsModel(action_cost=0.10, gamma=0.95)
     d.register_state("s", 2)
     d.register_state("s2", 5)  # unvisited successor with actions
     # "north" moved to s2 with 0 reward
@@ -818,15 +831,16 @@ def test_udm_prefers_state_change_over_noop():
         dynamics=d,
         state_hash="s",
     )
-    # "north": Q = 0 + V(s2) - 0.10 = 0 + 0.5 - 0.10 = 0.40
-    # "look":  Q = 0 + V(s)  - 0.10 = 0 + 0.0 - 0.10 = -0.10
+    # V(s2) = 0.575 (5 untried: 1/5 + 0.95·0.5 - 0.10)
+    # "north": Q = 0 + V(s2) - 0.10, V(s2) > V(s)
+    # "look":  Q = 0 + V(s) - 0.10, V(s) self-loop limited
     assert decision == ('take', 'north')
 
 
 def test_udm_untried_beats_tried_zero():
     """Untried action preferred over tried r=0 no-op."""
     udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
-    d = DynamicsModel()
+    d = DynamicsModel(action_cost=0.10, gamma=0.95)
     d.register_state("s", 2)
     d.record_observation("s", "look", "s", 0.0)
 
@@ -838,8 +852,7 @@ def test_udm_untried_beats_tried_zero():
         dynamics=d,
         state_hash="s",
     )
-    # "look":  Q = 0 + V(s) - 0.10, V(s) = Beta(1,1+1).mean × 1/2 = (1/3)(1/2) ≈ 0.167
-    #   Q_look ≈ 0.067
+    # "look":  Q = 0 + V(s) - 0.10, V(s) Bellman-limited by self-loop
     # "north": Q = 0.5 + 0.5 - 0.10 = 0.90 (untried: belief mean + V₀)
     assert decision == ('take', 'north')
 
@@ -847,7 +860,6 @@ def test_udm_untried_beats_tried_zero():
 def test_udm_voi_includes_v0():
     """VOI > 0 for untried action with reliable sensor (V₀ in eu_if_yes)."""
     udm = UnifiedDecisionMaker(question_cost=0.01, action_cost=0.10)
-    d = DynamicsModel()
     sensor = BinarySensor(tp_alpha=9, tp_beta=1, fp_alpha=1, fp_beta=9)
 
     # Compute game EUs: both untried, both get V₀
@@ -857,3 +869,133 @@ def test_udm_voi_includes_v0():
     }
     voi = udm.compute_voi("a1", 0.5, 0.5, sensor, game_eus)
     assert voi > 0.0
+
+
+# ---------------------------------------------------------------------------
+# Bellman V(s) tests
+# ---------------------------------------------------------------------------
+
+def test_bellman_propagates_reward():
+    """Reward at s1→s2 should propagate back to V(s0) via Bellman."""
+    d = DynamicsModel(action_cost=0.10, gamma=0.95)
+    d.register_state("s0", 1)
+    d.register_state("s1", 1)
+    # Chain: s0 →(a0, r=0)→ s1 →(a1, r=5.0)→ s2
+    d.record_observation("s0", "a0", "s1", 0.0)
+    d.record_observation("s1", "a1", "s2", 5.0)
+
+    v_s2 = d.state_value("s2")  # unknown → 0.5
+    v_s1 = d.state_value("s1")  # Q(a1) = 5.0 + 0.95·0.5 - 0.10 = 5.375
+    v_s0 = d.state_value("s0")  # Q(a0) = 0 + 0.95·V(s1) - 0.10
+
+    assert v_s2 == 0.5
+    assert v_s1 > 5.0
+    assert v_s0 > 0.0
+    # Reward propagates: V(s0) reflects discounted reward from s1→s2
+    assert v_s0 > v_s2
+
+
+def test_bellman_cycle_converges():
+    """Self-loop s→s with r=0 converges to finite negative value."""
+    d = DynamicsModel(action_cost=0.10, gamma=0.95)
+    d.register_state("s", 1)
+    d.record_observation("s", "a", "s", 0.0)
+
+    v = d.state_value("s")
+    # V(s) = 0.95·V(s) - 0.10 → V(s) = -0.10/0.05 = -2.0
+    assert v < 0
+    assert abs(v - (-2.0)) < 0.02
+
+
+def test_bellman_cache_invalidation():
+    """Adding observations invalidates cache; V(s) changes."""
+    d = DynamicsModel(action_cost=0.10, gamma=0.95)
+    d.register_state("s", 2)
+    d.record_observation("s", "a1", "s", 0.0)
+    v_before = d.state_value("s")
+
+    # Add a rewarding observation — V(s) should change
+    d.record_observation("s", "a2", "s2", 5.0)
+    v_after = d.state_value("s")
+
+    assert v_after != v_before
+    assert v_after > v_before
+
+
+# ---------------------------------------------------------------------------
+# Mean reward convergence (Fix D2)
+# ---------------------------------------------------------------------------
+
+def test_mean_reward_converges_with_repeated_visits():
+    """Repeated visits with different rewards converge to running mean."""
+    d = DynamicsModel()
+    # First visit: r=20 (e.g., first-time score event)
+    d.record_observation("s1", "frotz", "s2", 20.0)
+    assert d.known_reward("s1", "frotz") == 20.0
+
+    # Second visit: r=0 (score already claimed)
+    d.record_observation("s1", "frotz", "s2", 0.0)
+    assert d.known_reward("s1", "frotz") == 10.0  # mean of 20 and 0
+
+    # Third visit: r=0
+    d.record_observation("s1", "frotz", "s2", 0.0)
+    obs = d.get_observation("s1", "frotz")
+    assert obs.visit_count == 3
+    assert abs(obs.mean_reward - 20.0/3) < 0.01
+
+
+def test_value_iteration_bounded_with_reward_cycle():
+    """V(s) stays bounded when a reward cycle exists (same (s,a) revisited).
+
+    Before Fix D1+D2, cycling s1 ↔ s2 with r=20 each time gave V(s1)≈200+.
+    Now the mean reward converges to truth and V(s) stays bounded.
+    """
+    d = DynamicsModel(action_cost=0.10, gamma=0.95)
+    d.register_state("s1", 2)
+    d.register_state("s2", 2)
+
+    # Simulate cycle: s1→s2 (r=20 first, then r=0), s2→s1 (r=0 always)
+    d.record_observation("s1", "frotz", "s2", 20.0)
+    d.record_observation("s2", "turn off", "s1", 0.0)
+    d.record_observation("s1", "look", "s1", 0.0)
+    d.record_observation("s2", "look", "s2", 0.0)
+
+    v1 = d.state_value("s1")
+    # With r=20 one-shot, V(s1) should be large but finite
+    assert v1 > 0
+    assert v1 < 500  # not blowing up
+
+    # Now revisit with r=0 — mean reward drops to 10
+    d.record_observation("s1", "frotz", "s2", 0.0)
+    v1_after = d.state_value("s1")
+    assert v1_after < v1  # value decreased because mean reward dropped
+
+
+# ---------------------------------------------------------------------------
+# ObservedOutcome fields (Fix D2)
+# ---------------------------------------------------------------------------
+
+def test_observed_outcome_mean_reward():
+    """mean_reward property works correctly."""
+    o = ObservedOutcome(next_state_hash="s2", reward=5.0)
+    assert o.visit_count == 1
+    assert o.reward_sum == 5.0
+    assert o.mean_reward == 5.0
+
+    # Simulate accumulation
+    o.visit_count += 1
+    o.reward_sum += 0.0
+    o.reward = o.mean_reward
+    assert o.mean_reward == 2.5
+
+
+# ---------------------------------------------------------------------------
+# Categorical sensor Beta(1,1) prior (Fix A)
+# ---------------------------------------------------------------------------
+
+def test_categorical_sensor_max_entropy_prior():
+    """Default categorical sensor has Beta(1,1) — max entropy for untested sensor."""
+    cs = CategoricalSensor()
+    assert cs.accuracy_alpha == 1.0
+    assert cs.accuracy_beta == 1.0
+    assert abs(cs.accuracy - 0.5) < 0.01

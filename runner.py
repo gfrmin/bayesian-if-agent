@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import logging
 import os
 import re
 from typing import Dict, List, Optional, Tuple
@@ -27,6 +28,8 @@ from core import (
     QuestionType,
     UnifiedDecisionMaker,
 )
+
+log = logging.getLogger(__name__)
 
 
 # =============================================================================
@@ -75,6 +78,20 @@ def resolve_game_path(game_arg: str) -> str:
 # HELPERS
 # =============================================================================
 
+def _sensor_evidence_weight(sensor: 'BinarySensor') -> float:
+    """Weight for moment-matching: 0 for untested sensor, approaches 1 with evidence.
+
+    An untested BinarySensor has prior pseudocounts summing to 3 per parameter
+    (TPR ~ Beta(2,1), FPR ~ Beta(1,2)). Weight = max(0, (total - prior_total) / total)
+    for each parameter; take the min so both TPR and FPR must have evidence.
+    """
+    tp_total = sensor.tp_alpha + sensor.tp_beta
+    fp_total = sensor.fp_alpha + sensor.fp_beta
+    w_tp = max(0.0, (tp_total - 3.0) / tp_total)
+    w_fp = max(0.0, (fp_total - 3.0) / fp_total)
+    return min(w_tp, w_fp)
+
+
 def _moment_match_beta(
     alpha: float,
     beta: float,
@@ -87,30 +104,46 @@ def _moment_match_beta(
 
     The likelihood P(yes | theta) = TPR * theta + FPR * (1 - theta) is linear
     in theta, so the exact posterior is not Beta. We compute the posterior mean
-    via Bayes' rule and preserve the total count, incrementing by 1 to reflect
-    the new evidence.
+    via Bayes' rule and scale the total-count increment by evidence weight so
+    untested sensors contribute nothing.
     """
     prior_mean = alpha / (alpha + beta)
     posterior_mean = sensor.posterior(prior_mean, said_yes)
-    new_total = alpha + beta + 1.0
-    return (posterior_mean * new_total, (1.0 - posterior_mean) * new_total)
+    w = _sensor_evidence_weight(sensor)
+    effective_mean = prior_mean + w * (posterior_mean - prior_mean)
+    new_total = alpha + beta + w
+    return (effective_mean * new_total, (1.0 - effective_mean) * new_total)
+
+
+def _categorical_evidence_weight(sensor: 'CategoricalSensor') -> float:
+    """Weight for categorical moment-matching: 0 for untested, approaches 1 with evidence.
+
+    CategoricalSensor has prior Beta(1,1), total = 2. Weight = max(0, (total - 2) / total).
+    """
+    total = sensor.accuracy_alpha + sensor.accuracy_beta
+    return max(0.0, (total - 2.0) / total)
 
 
 def _moment_match_beta_from_posteriors(
     action_beliefs: Dict[str, Tuple[float, float]],
     posteriors: Dict[str, float],
+    sensor: 'CategoricalSensor',
 ) -> Dict[str, Tuple[float, float]]:
     """
     Moment-match categorical posteriors back to Beta distributions.
 
-    For each action, preserves total count (incrementing by 1) and sets
-    the new mean to the categorical posterior.
+    For each action, preserves total count (incrementing by evidence weight)
+    and sets the new mean to the categorical posterior. Untested sensor
+    contributes weight 0.
     """
+    w = _categorical_evidence_weight(sensor)
     result = {}
     for a, (alpha, beta) in action_beliefs.items():
-        new_mean = posteriors.get(a, alpha / (alpha + beta))
-        new_total = alpha + beta + 1.0
-        result[a] = (new_mean * new_total, (1.0 - new_mean) * new_total)
+        prior_mean = alpha / (alpha + beta)
+        posterior_mean = posteriors.get(a, prior_mean)
+        effective_mean = prior_mean + w * (posterior_mean - prior_mean)
+        new_total = alpha + beta + w
+        result[a] = (effective_mean * new_total, (1.0 - effective_mean) * new_total)
     return result
 
 
@@ -149,7 +182,7 @@ class BayesianIFAgent:
         self.sensor_bank: Optional[LLMSensorBank] = (
             LLMSensorBank(llm_client) if llm_client is not None else None
         )
-        self.dynamics = DynamicsModel()
+        self.dynamics = DynamicsModel(action_cost=action_cost, gamma=0.95)
         self.beliefs = BeliefState()
         self.decision_maker = UnifiedDecisionMaker(
             question_cost=question_cost,
@@ -179,8 +212,8 @@ class BayesianIFAgent:
         self.episode_count: int = 0
 
     def get_state_hash(self, env: FrotzEnv) -> str:
-        """Get hash of current game state."""
-        return str(env.get_world_state_hash())
+        """Get hash of current game state, augmented with score for Markov property."""
+        return f"{env.get_world_state_hash()}_{env.get_score()}"
 
     def _query_suggestion(self, observation: str, valid_actions: List[str], context: str) -> Optional[str]:
         """Query LLM for categorical action suggestion. Returns action or None."""
@@ -328,8 +361,10 @@ Answer (YES or NO):"""
                         for a, ab in action_beliefs.items()
                     }
                     posteriors = self.categorical_sensor.posteriors(priors, suggested)
-                    # Moment-match all action beliefs
-                    action_beliefs = _moment_match_beta_from_posteriors(action_beliefs, posteriors)
+                    # Moment-match all action beliefs (evidence-weighted)
+                    action_beliefs = _moment_match_beta_from_posteriors(
+                        action_beliefs, posteriors, self.categorical_sensor
+                    )
                     for a, ab in action_beliefs.items():
                         self.beliefs.set_action_belief(a, *ab)
 
@@ -427,20 +462,21 @@ Answer (YES or NO):"""
                 self.progress_sensor.update(said_yes=progress_said_yes, was_true=True)
                 self.progress_sensor.query_count += 1
 
-        # Conjugate Beta update from ground truth
+        # Conjugate Beta update from ground truth (always, even first observation)
         ab = self.beliefs.get_action_belief(action)
-        if ab is not None:
-            alpha, beta = ab
-            if helped:
-                self.beliefs.set_action_belief(action, alpha + 1, beta)
-            else:
-                self.beliefs.set_action_belief(action, alpha, beta + 1)
+        if ab is None:
+            n = len(env.get_valid_actions() or ["look"])
+            ab = (1.0 / n, 1.0 - 1.0 / n)
+        alpha, beta = ab
+        if helped:
+            self.beliefs.set_action_belief(action, alpha + 1, beta)
+        else:
+            self.beliefs.set_action_belief(action, alpha, beta + 1)
 
     def play_episode(
         self,
         env: FrotzEnv,
         max_steps: int = 100,
-        verbose: bool = False,
     ) -> Dict:
         """Play one episode."""
         obs, _info = env.reset()
@@ -453,26 +489,22 @@ Answer (YES or NO):"""
         self.last_suggestion = None
         self.last_observation = ""
 
-        if verbose:
-            print(f"\n{'='*60}")
-            print(f"Episode {self.episode_count + 1}")
-            print(f"{'='*60}")
-            print(obs[:400])
+        log.debug("\n%s\nEpisode %d\n%s", "=" * 60, self.episode_count + 1, "=" * 60)
+        log.debug(obs[:400])
 
         while not env.game_over() and steps < max_steps:
             action, explanation = self.choose_action(env, obs)
 
-            if verbose:
-                print(f"\n> {action}")
-                print(f"  {explanation}")
+            log.debug("\n> %s", action)
+            log.debug("  %s", explanation)
 
             old_score = env.get_score()
             obs, reward, _done, _info = env.step(action)
             new_score = env.get_score()
             steps += 1
 
-            if verbose and new_score > old_score:
-                print(f"  *** SCORE: {old_score} -> {new_score} ***")
+            if new_score > old_score:
+                log.debug("  *** SCORE: %d -> %d ***", old_score, new_score)
 
             self.observe_outcome(env, action, obs, reward)
 
@@ -500,17 +532,13 @@ Answer (YES or NO):"""
         game_path: str,
         n_episodes: int = 10,
         max_steps: int = 100,
-        verbose: bool = False,
     ) -> List[Dict]:
         """Play multiple episodes, learning across them."""
         env = FrotzEnv(game_path)
         results = []
 
         for i in range(n_episodes):
-            result = self.play_episode(
-                env, max_steps,
-                verbose=(verbose and i < 2),
-            )
+            result = self.play_episode(env, max_steps)
             results.append(result)
 
             sensor_info = ""
@@ -521,43 +549,41 @@ Answer (YES or NO):"""
                 cat_stats = self.categorical_sensor.get_stats()
                 sensor_info += f", cat_acc={cat_stats['accuracy']:.2f}"
 
-            print(
-                f"Episode {i+1}: score={result['final_score']}, "
-                f"steps={result['steps']}{sensor_info}"
+            log.info(
+                "Episode %d: score=%s, steps=%s%s",
+                i + 1, result['final_score'], result['steps'], sensor_info,
             )
 
         # Final summary
         scores = [r['final_score'] for r in results]
-        print(f"\n{'='*60}")
-        print(f"SUMMARY")
-        print(f"{'='*60}")
-        print(f"Scores: {scores}")
-        print(f"Mean: {sum(scores)/len(scores):.2f}, Max: {max(scores)}")
-        print(f"Total questions asked: {self.total_questions_asked}")
-        print(f"Dynamics: {self.dynamics.get_stats()}")
+        log.info("\n%s\nSUMMARY\n%s", "=" * 60, "=" * 60)
+        log.info("Scores: %s", scores)
+        log.info("Mean: %.2f, Max: %s", sum(scores) / len(scores), max(scores))
+        log.info("Total questions asked: %s", self.total_questions_asked)
+        log.info("Dynamics: %s", self.dynamics.get_stats())
 
         if self.sensor_bank is not None:
             for qt, sensor in self.sensor_bank.sensors.items():
                 stats = sensor.get_stats()
                 if stats['ground_truths'] > 0:
-                    print(
-                        f"Sensor {qt.value}: TPR={stats['tpr']:.2f}, "
-                        f"FPR={stats['fpr']:.2f}, n={stats['ground_truths']}"
+                    log.info(
+                        "Sensor %s: TPR=%.2f, FPR=%.2f, n=%d",
+                        qt.value, stats['tpr'], stats['fpr'], stats['ground_truths'],
                     )
 
         if self.categorical_sensor is not None:
             cat_stats = self.categorical_sensor.get_stats()
-            print(
-                f"Categorical sensor: accuracy={cat_stats['accuracy']:.2f}, "
-                f"queries={cat_stats['queries']}, ground_truths={cat_stats['ground_truths']}"
+            log.info(
+                "Categorical sensor: accuracy=%.2f, queries=%d, ground_truths=%d",
+                cat_stats['accuracy'], cat_stats['queries'], cat_stats['ground_truths'],
             )
 
         if self.progress_sensor is not None:
             prog_stats = self.progress_sensor.get_stats()
             if prog_stats['ground_truths'] > 0:
-                print(
-                    f"Progress sensor: TPR={prog_stats['tpr']:.2f}, "
-                    f"FPR={prog_stats['fpr']:.2f}, n={prog_stats['ground_truths']}"
+                log.info(
+                    "Progress sensor: TPR=%.2f, FPR=%.2f, n=%d",
+                    prog_stats['tpr'], prog_stats['fpr'], prog_stats['ground_truths'],
                 )
 
         env.close()
@@ -575,22 +601,21 @@ def run_benchmark(
     question_cost: float = 0.01,
     action_cost: float = 0.10,
     suggestion_cost: Optional[float] = None,
-    verbose: bool = False,
 ):
     """Run benchmark across all GLoW games and print summary table."""
-    print("=" * 70)
-    print("BENCHMARK: GLoW Games")
-    print("=" * 70)
+    log.info("=" * 70)
+    log.info("BENCHMARK: GLoW Games")
+    log.info("=" * 70)
 
     results_table = []
 
     for game_name, (filename, max_score, category) in BENCHMARK_GAMES.items():
         game_path = os.path.join(GAMES_DIR, filename)
         if not os.path.isfile(game_path):
-            print(f"  SKIP {game_name}: {filename} not found")
+            log.warning("  SKIP %s: %s not found", game_name, filename)
             continue
 
-        print(f"\n--- {game_name} ({category}, max={max_score}) ---")
+        log.info("\n--- %s (%s, max=%d) ---", game_name, category, max_score)
 
         agent = BayesianIFAgent(
             llm_client=llm_client,
@@ -603,7 +628,6 @@ def run_benchmark(
             game_path=game_path,
             n_episodes=n_episodes,
             max_steps=max_steps,
-            verbose=verbose,
         )
 
         scores = [r['final_score'] for r in game_results]
@@ -626,17 +650,16 @@ def run_benchmark(
             "cat_acc": cat_acc,
         })
 
-    # Print summary table
-    print(f"\n{'='*70}")
-    print("BENCHMARK SUMMARY")
-    print(f"{'='*70}")
-    print(f"{'Game':<12} {'Cat':>5} {'Max':>5} {'Mean':>6} {'Best':>5} {'%':>6} {'Qs':>5} {'CatAcc':>7}")
-    print("-" * 55)
+    # Summary table
+    log.info("\n%s\nBENCHMARK SUMMARY\n%s", "=" * 70, "=" * 70)
+    log.info("%-12s %5s %5s %6s %5s %6s %5s %7s", "Game", "Cat", "Max", "Mean", "Best", "%", "Qs", "CatAcc")
+    log.info("-" * 55)
     for r in results_table:
         cat_str = f"{r['cat_acc']:.2f}" if r['cat_acc'] is not None else "n/a"
-        print(
-            f"{r['game']:<12} {r['category']:>5} {r['max_score']:>5} "
-            f"{r['mean']:>6.1f} {r['max']:>5} {r['pct']:>5.1f}% {r['questions']:>5} {cat_str:>7}"
+        log.info(
+            "%-12s %5s %5d %6.1f %5d %5.1f%% %5d %7s",
+            r['game'], r['category'], r['max_score'],
+            r['mean'], r['max'], r['pct'], r['questions'], cat_str,
         )
 
     return results_table
@@ -677,8 +700,14 @@ def main():
                         help="Cost of categorical suggestion query (defaults to question-cost)")
     args = parser.parse_args()
 
-    print("Bayesian IF Agent v5")
-    print("=" * 60)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(message)s",
+    )
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+    log.info("Bayesian IF Agent v5")
+    log.info("=" * 60)
 
     # Check for Ollama
     llm_client = None
@@ -686,11 +715,12 @@ def main():
         from ollama_client import OllamaClient, OllamaConfig
         config = OllamaConfig(model=args.model)
         llm_client = OllamaClient(config)
-        print(f"LLM: ACTIVE (Ollama detected, model={args.model})")
+        log.info("LLM: ACTIVE (Ollama detected, model=%s)", args.model)
     else:
-        print("LLM: INACTIVE (Ollama not running, using dynamics-only)")
+        log.info("LLM: INACTIVE (Ollama not running, using dynamics-only)")
 
-    if args.benchmark:
+    # Default to benchmark when no game specified
+    if args.benchmark or (args.game_name is None and args.game is None):
         run_benchmark(
             llm_client=llm_client,
             n_episodes=args.episodes,
@@ -698,19 +728,16 @@ def main():
             question_cost=args.question_cost,
             action_cost=args.action_cost,
             suggestion_cost=args.suggestion_cost,
-            verbose=args.verbose,
         )
         return
 
     # Resolve game path
     if args.game_name is not None:
         game_path = resolve_game_path(args.game_name)
-    elif args.game is not None:
-        game_path = resolve_game_path(args.game)
     else:
-        game_path = os.path.join(GAMES_DIR, "905.z5")
+        game_path = resolve_game_path(args.game)
 
-    print(f"Game: {game_path}")
+    log.info("Game: %s", game_path)
 
     agent = BayesianIFAgent(
         llm_client=llm_client,
@@ -723,7 +750,6 @@ def main():
         game_path=game_path,
         n_episodes=args.episodes,
         max_steps=args.max_steps,
-        verbose=args.verbose,
     )
 
 

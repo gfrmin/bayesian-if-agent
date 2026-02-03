@@ -128,7 +128,7 @@ class CategoricalSensor:
     over wrong actions.
     """
 
-    accuracy_alpha: float = 2.0  # Beta(2,1), mean 0.67
+    accuracy_alpha: float = 1.0  # Beta(1,1), max-entropy for untested sensor
     accuracy_beta: float = 1.0
 
     query_count: int = 0
@@ -381,6 +381,17 @@ class ObservedOutcome:
     next_state_hash: str
     reward: float
     observation_text: str = ""
+    visit_count: int = 1
+    reward_sum: float = 0.0
+
+    def __post_init__(self):
+        if self.reward_sum == 0.0 and self.visit_count == 1:
+            self.reward_sum = self.reward
+
+    @property
+    def mean_reward(self) -> float:
+        """Running mean reward for this (state, action) pair."""
+        return self.reward_sum / self.visit_count if self.visit_count > 0 else 0.0
 
 
 class DynamicsModel:
@@ -388,16 +399,25 @@ class DynamicsModel:
     Learned dynamics from direct experience.
 
     In a deterministic game, one observation = certainty.
+    State values computed via Bellman value iteration over the learned
+    dynamics graph, cached with dirty flag.
     """
 
-    def __init__(self):
+    def __init__(self, action_cost: float = 0.10, gamma: float = 0.95):
+        """
+        Args:
+            action_cost: Cost per game action (same as UnifiedDecisionMaker).
+            gamma: Discount factor. 0.95 models finite horizon (γ^100 ≈ 0.006).
+                   Prevents divergence in cycles (go east / go west).
+        """
+        self.action_cost = action_cost
+        self.gamma = gamma
         self.observations: Dict[StateActionKey, ObservedOutcome] = {}
         self.tried_actions: Set[str] = set()
         self.total_observations: int = 0
-        # Per-state tracking for V(s)
-        self._state_tried: Dict[str, int] = {}
-        self._state_rewards: Dict[str, int] = {}
         self._state_n_total: Dict[str, int] = {}
+        self._cached_values: Dict[str, float] = {}
+        self._values_dirty: bool = True
 
     def has_observation(self, state_hash: str, action: str) -> bool:
         """Have we tried this action in this state?"""
@@ -410,6 +430,7 @@ class DynamicsModel:
     def register_state(self, state_hash: str, n_total: int):
         """Register the total number of actions available in a state."""
         self._state_n_total[state_hash] = n_total
+        self._values_dirty = True
 
     def record_observation(
         self,
@@ -419,41 +440,106 @@ class DynamicsModel:
         reward: float,
         observation_text: str = "",
     ):
-        """Record an observed outcome."""
+        """Record an observed outcome, accumulating reward statistics."""
         key = StateActionKey(state_hash, action)
-        is_new = key not in self.observations
-        self.observations[key] = ObservedOutcome(
-            next_state_hash=next_state_hash,
-            reward=reward,
-            observation_text=observation_text,
-        )
+        existing = self.observations.get(key)
+        if existing is not None:
+            existing.visit_count += 1
+            existing.reward_sum += reward
+            existing.next_state_hash = next_state_hash
+            existing.observation_text = observation_text
+            existing.reward = existing.mean_reward
+        else:
+            self.observations[key] = ObservedOutcome(
+                next_state_hash=next_state_hash,
+                reward=reward,
+                observation_text=observation_text,
+            )
         self.tried_actions.add(action)
         self.total_observations += 1
-        if is_new:
-            self._state_tried[state_hash] = self._state_tried.get(state_hash, 0) + 1
-            if reward > 0:
-                self._state_rewards[state_hash] = self._state_rewards.get(state_hash, 0) + 1
+        self._values_dirty = True
 
     def known_reward(self, state_hash: str, action: str) -> Optional[float]:
-        """Get known reward for state-action pair. None if unobserved."""
+        """Get known mean reward for state-action pair. None if unobserved."""
         obs = self.get_observation(state_hash, action)
-        return obs.reward if obs else None
+        return obs.mean_reward if obs else None
 
     def state_value(self, state_hash: str) -> float:
-        """V(s): estimated value of a state based on exploration history.
+        """V(s): Bellman value of a state from learned dynamics.
 
-        Beta(1+r, 1+f) mean × untried_fraction.
-        Returns V₀ = 0.5 for unregistered/unvisited states.
+        Returns 0.5 (max-entropy prior) for unknown states not in the
+        dynamics graph.
         """
-        n_total = self._state_n_total.get(state_hash, 0)
-        if n_total == 0:
-            return 0.5  # V₀: Beta(1,1) maximum-entropy prior
-        n_tried = self._state_tried.get(state_hash, 0)
-        n_rewards = self._state_rewards.get(state_hash, 0)
-        n_untried = max(0, n_total - n_tried)
-        beta_mean = (1 + n_rewards) / (2 + n_tried)
-        untried_frac = n_untried / n_total
-        return beta_mean * untried_frac
+        if self._values_dirty:
+            self._run_value_iteration()
+        return self._cached_values.get(state_hash, 0.5)
+
+    def _run_value_iteration(self):
+        """Synchronous Bellman value iteration over the dynamics graph.
+
+        V(s) = max_a Q(s, a)
+        Q(s, a_tried)   = R(s,a) + γ·V(s') - c_act
+        Q(s, a_untried)  = 1/N + γ·V_unknown - c_act
+        V(s_unknown)     = 0.5   (Beta(1,1) max-entropy prior)
+        """
+        v_unknown = 0.5
+
+        # Collect all states: registered states + successor states from observations
+        all_states: Set[str] = set(self._state_n_total.keys())
+        for key, obs in self.observations.items():
+            all_states.add(key.state_hash)
+            all_states.add(obs.next_state_hash)
+
+        if not all_states:
+            self._cached_values = {}
+            self._values_dirty = False
+            return
+
+        # Build per-state tried actions index
+        state_tried: Dict[str, List[StateActionKey]] = {}
+        for key in self.observations:
+            state_tried.setdefault(key.state_hash, []).append(key)
+
+        # Initialize values
+        values = {s: 0.0 for s in all_states}
+
+        for _ in range(100):
+            max_delta = 0.0
+            new_values = {}
+            for s in all_states:
+                n_total = self._state_n_total.get(s, 0)
+                tried_keys = state_tried.get(s, [])
+                n_tried = len(tried_keys)
+
+                # Compute Q-values for tried actions
+                q_values = []
+                for key in tried_keys:
+                    obs = self.observations[key]
+                    v_next = values.get(obs.next_state_hash, v_unknown)
+                    q = obs.mean_reward + self.gamma * v_next - self.action_cost
+                    q_values.append(q)
+
+                # Q-value for untried actions (structural prior)
+                n_untried = max(0, n_total - n_tried)
+                if n_untried > 0:
+                    q_untried = (1.0 / n_total) + self.gamma * v_unknown - self.action_cost
+                    q_values.append(q_untried)
+
+                if q_values:
+                    new_v = max(q_values)
+                else:
+                    # State with no known actions and not registered
+                    new_v = v_unknown
+
+                new_values[s] = new_v
+                max_delta = max(max_delta, abs(new_v - values[s]))
+
+            values = new_values
+            if max_delta < 1e-6:
+                break
+
+        self._cached_values = values
+        self._values_dirty = False
 
     def get_stats(self) -> dict:
         return {
@@ -742,11 +828,14 @@ if __name__ == "__main__":
     assert dynamics.known_reward("s1", "go") == 1.0
     assert "go" in dynamics.tried_actions
 
-    # Overwrite (deterministic game)
+    # Accumulate (running mean reward)
     dynamics.record_observation("s1", "go", "s2", 1.0, "You go north again.")
     assert dynamics.total_observations == 2
     stats = dynamics.get_stats()
     assert stats["unique_state_actions"] == 1
+    obs = dynamics.get_observation("s1", "go")
+    assert obs.visit_count == 2
+    assert obs.mean_reward == 1.0  # both visits had r=1.0
     print(f"\nDynamics stats: {stats}")
 
     # Test 7: UnifiedDecisionMaker (no action_prior — uses 1/N from beliefs)
@@ -790,9 +879,9 @@ if __name__ == "__main__":
     assert voi >= 0
     print(f"VOI: {voi:.4f}")
 
-    # Test 8: CategoricalSensor
+    # Test 8: CategoricalSensor (Beta(1,1) max-entropy prior)
     cat = CategoricalSensor()
-    assert abs(cat.accuracy - 2/3) < 0.01
+    assert abs(cat.accuracy - 0.5) < 0.01
     assert cat.query_count == 0
     assert cat.ground_truth_count == 0
     print(f"\nCategoricalSensor: accuracy={cat.accuracy:.2f}")
@@ -812,11 +901,11 @@ if __name__ == "__main__":
 
     # Accuracy updates from ground truth
     cat.update(suggested_correct=True)
-    assert cat.accuracy > 2/3
+    assert cat.accuracy > 0.5
     cat.update(suggested_correct=False)
     cat.update(suggested_correct=False)
-    # After 1 correct, 2 incorrect from prior Beta(2,1): Beta(3,3), mean 0.5
-    assert abs(cat.accuracy - 0.5) < 0.01
+    # After 1 correct, 2 incorrect from prior Beta(1,1): Beta(2,3), mean 0.4
+    assert abs(cat.accuracy - 0.4) < 0.01
     assert cat.ground_truth_count == 3
     print(f"After 3 updates: accuracy={cat.accuracy:.2f}")
 
